@@ -13,6 +13,16 @@ import (
 	"sync"
 )
 
+// Add to the top of stacktrace.go after imports:
+
+// NEW: Pool for stack trace arrays
+var stackPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]uintptr, 32)
+		return &s
+	},
+}
+
 // Frame represents a program counter inside a stack frame
 type Frame uintptr
 
@@ -173,16 +183,21 @@ func (s *stack) StackTrace() StackTrace {
 // callersMu protects the callers function
 var callersMu sync.Mutex
 
-// callers returns a stack of program counters
+// OPTIMIZED: callers function using pool
 func callers() *stack {
 	callersMu.Lock()
 	defer callersMu.Unlock()
 
-	const depth = 32
-	var pcs [depth]uintptr
-	n := runtime.Callers(3, pcs[:])
-	var st stack = pcs[0:n]
-	return &st
+	pcsPtr := stackPool.Get().(*[]uintptr)
+	pcs := *pcsPtr
+
+	n := runtime.Callers(3, pcs)
+	result := make(stack, n)
+	copy(result, pcs[0:n])
+
+	stackPool.Put(pcsPtr)
+
+	return &result
 }
 
 // funcname removes the path prefix component of a function's name

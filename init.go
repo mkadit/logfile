@@ -41,55 +41,58 @@ func CreateLogger() {
 	logChannel = make(chan LogPayload, currentConfig.General.LogChannel)
 
 	// Start with base number of workers
-	baseWorkers := 4
-	maxWorkers := 16
-	currentWorkers := baseWorkers
+	baseWorkers := 8
+	maxWorkers := 32
 
-	// Start initial workers
-	for i := 0; i < baseWorkers; i++ {
-		logWorkers.Add(1)
-		go logWorker(fmt.Sprintf("worker-%d", i))
+	if Config != nil {
+		if Config.General.WorkerPoolSize > 0 {
+			baseWorkers = Config.General.WorkerPoolSize
+		}
+		if Config.General.MaxWorkerPoolSize > 0 {
+			maxWorkers = Config.General.MaxWorkerPoolSize
+		}
 	}
 
-	// Monitor channel usage and scale workers dynamically
+	// Start base workers
+	for i := 0; i < baseWorkers; i++ {
+		logWorkers.Add(1)
+		go logWorker()
+	}
+
+	// OPTIMIZED: More aggressive worker scaling
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(3 * time.Second) // Reduced from 5s
 		defer ticker.Stop()
 
+		currentWorkers := baseWorkers
+
 		for range ticker.C {
-			channelUsage := len(logChannel)
-			channelCap := cap(logChannel)
-			usagePercent := float64(channelUsage) / float64(channelCap) * 100
+			usage := float64(len(logChannel)) / float64(cap(logChannel))
 
-			// Scale up if channel is > 70% full and we haven't hit max workers
-			if usagePercent > 70 && currentWorkers < maxWorkers {
-				logWorkers.Add(1)
-				go logWorker(fmt.Sprintf("scaled-worker-%d", currentWorkers))
-				currentWorkers++
-				// log.Printf("Scaled up log workers to %d (channel usage: %.1f%%)", currentWorkers, usagePercent)
-				LogDebugEvent(nil, false, fmt.Sprintf("Scaled up log workers to %d (channel usage: %.1f%%)", currentWorkers, usagePercent))
+			// Scale up more aggressively
+			if usage > 0.4 && currentWorkers < maxWorkers {
+				newWorkers := min(maxWorkers-currentWorkers, 4) // Add 4 at a time
+				for i := 0; i < newWorkers; i++ {
+					logWorkers.Add(1)
+					go logWorker()
+					currentWorkers++
+				}
 			}
 
-			// Scale down if channel is < 20% full and we have more than base workers
-			if usagePercent < 20 && currentWorkers > baseWorkers {
-				// Note: We can't actually stop existing workers easily,
-				// but we can track this for next restart or implement worker shutdown
-				LogDebugEvent(nil, false, fmt.Sprintf("Channel usage low: %.1f%% (workers: %d)", usagePercent, currentWorkers))
-			}
-
-			// Log warnings for high usage
-			if usagePercent > 90 {
-				LogWarnEvent(nil, false, fmt.Sprintf("WARNING: Log channel usage very high: %.1f%%", usagePercent))
+			// Scale down when idle
+			if usage < 0.1 && currentWorkers > baseWorkers {
+				// Workers will naturally exit when channel is empty
+				currentWorkers = max(baseWorkers, currentWorkers-2)
 			}
 		}
 	}()
 
 	// Rest of your existing CreateLogger code...
 	if err := SetLogger(); err != nil {
-		LogFatal(nil, err, "SYSTEM: logger cannot be set")
+		Fatal(nil, err, "SYSTEM: logger cannot be set")
 	}
 
-	LogInfoEvent(nil, false, "logger created",
+	Info(nil, false, "logger created",
 		slog.Group("data",
 			slog.Any("config", currentConfig),
 			slog.Int("initial_workers", baseWorkers),
@@ -106,17 +109,16 @@ func CreateLogger() {
 				if err := SetLogger(); err != nil {
 					log.Printf("SYSTEM: logger rotation failed: %v", err)
 				} else {
-					LogInfoEvent(nil, true, "log rotation success")
+					Info(nil, true, "log rotation success")
 				}
 			}
 		}()
 	}
 }
 
-// Enhanced logWorker with ID for debugging
-func logWorker(workerID string) {
+// OPTIMIZED: logWorker with object pooling
+func logWorker() {
 	defer logWorkers.Done()
-	log.Printf("Log worker %s started", workerID)
 
 	for payload := range logChannel {
 		logToSpecificLogger(
@@ -129,9 +131,12 @@ func logWorker(workerID string) {
 			payload.Ml,
 			payload.OtherAttrs,
 		)
-	}
 
-	log.Printf("Log worker %s stopped", workerID)
+		// Return payload to pool if pooling is enabled
+		if Config != nil && Config.General.EnableObjectPooling {
+			putLogPayload(&payload)
+		}
+	}
 }
 
 // Shutdown gracefully shuts down the logging system, ensuring all async logs are written.

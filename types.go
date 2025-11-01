@@ -1,4 +1,4 @@
-// logfile/types.go - Core types and global variables for the logging system
+// logfile/types.go - Optimized core types with object pooling
 package logfile
 
 import (
@@ -12,22 +12,36 @@ import (
 
 // Global variables for the logging system state
 var (
-	AppLogger   *Loggers          // AppLogger is the main logger instance for the application
-	Config      *LogConfiguration // Config holds the loaded logging configuration
-	loggerMutex sync.RWMutex      // loggerMutex ensures thread-safe logger operations and configuration changes
+	AppLogger   *Loggers
+	Config      *LogConfiguration
+	loggerMutex sync.RWMutex
 	configMutex sync.RWMutex
 
-	// New variables for asynchronous logging
-	logChannel chan LogPayload // A channel to hold log entries for async processing
-	logWorkers sync.WaitGroup  // A WaitGroup to ensure all workers finish before shutdown
+	logChannel chan LogPayload
+	logWorkers sync.WaitGroup
 
-	TimeFormat        = time.DateOnly    // TimeFormat defines the date format used for log files
-	DefaultTimeFormat = time.RFC3339Nano // A default robust time format for structured logs (e.g., "2006-01-02T15:04:05.999999999Z07:00")
-	Testing           bool               // Testing indicates if we're in test mode (suppresses logging to actual files sometimes)
+	TimeFormat        = time.DateOnly
+	DefaultTimeFormat = time.RFC3339Nano
+	Testing           bool
+
+	// NEW: Object pools for reducing allocations
+	logPayloadPool = sync.Pool{
+		New: func() interface{} {
+			return &LogPayload{
+				OtherAttrs: make([]any, 0, 8), // Pre-allocate common size
+			}
+		},
+	}
+
+	attrSlicePool = sync.Pool{
+		New: func() interface{} {
+			slice := make([]slog.Attr, 0, 16) // Pre-allocate common size
+			return &slice
+		},
+	}
 )
 
-// LogPayload is a struct to hold all necessary info for a single log entry,
-// used for passing log requests to the async channel.
+// LogPayload is a struct to hold all necessary info for a single log entry
 type LogPayload struct {
 	Logger     *MultLogger
 	Level      LogLevel
@@ -39,21 +53,51 @@ type LogPayload struct {
 	OtherAttrs []any
 }
 
-// LogLevel represents different log severity levels (e.g., Debug, Info, Error)
+// NEW: Reset method for pool reuse
+func (lp *LogPayload) Reset() {
+	lp.Logger = nil
+	lp.Level = 0
+	lp.EventType = ""
+	lp.Err = nil
+	lp.Msg = ""
+	lp.TimeNow = ""
+	lp.Ml = nil
+	lp.OtherAttrs = lp.OtherAttrs[:0] // Keep capacity, reset length
+}
+
+// NEW: Pool management functions
+func getLogPayload() *LogPayload {
+	return logPayloadPool.Get().(*LogPayload)
+}
+
+func putLogPayload(lp *LogPayload) {
+	lp.Reset()
+	logPayloadPool.Put(lp)
+}
+
+func getAttrSlice() *[]slog.Attr {
+	return attrSlicePool.Get().(*[]slog.Attr)
+}
+
+func putAttrSlice(slice *[]slog.Attr) {
+	*slice = (*slice)[:0] // Reset length, keep capacity
+	attrSlicePool.Put(slice)
+}
+
+// LogLevel represents different log severity levels
 type (
 	LogLevel int
 	MsgKey   struct{}
 )
 
 const (
-	LevelDebug    LogLevel = iota // 0
-	LevelInfo                     // 1
-	LevelWarn                     // 2
-	LevelError                    // 3
-	LevelCritical                 // 4
+	LevelDebug LogLevel = iota
+	LevelInfo
+	LevelWarn
+	LevelError
+	LevelCritical
 )
 
-// String returns the string representation of a LogLevel.
 func (l LogLevel) String() string {
 	switch l {
 	case LevelDebug:
@@ -71,7 +115,6 @@ func (l LogLevel) String() string {
 	}
 }
 
-// ParseLogLevel converts a string to a LogLevel.
 func ParseLogLevel(levelStr string) (LogLevel, error) {
 	switch levelStr {
 	case "debug":
@@ -89,7 +132,6 @@ func ParseLogLevel(levelStr string) (LogLevel, error) {
 	}
 }
 
-// ToSlogLevel converts LogLevel to slog.Level.
 func (l LogLevel) ToSlogLevel() slog.Level {
 	switch l {
 	case LevelDebug:
@@ -98,44 +140,39 @@ func (l LogLevel) ToSlogLevel() slog.Level {
 		return slog.LevelInfo
 	case LevelWarn:
 		return slog.LevelWarn
-	case LevelError, LevelCritical: // Map critical/fatal/index to slog.LevelError for consistency
+	case LevelError, LevelCritical:
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
 	}
 }
 
-// MultLogger combines standard (log.Logger) and structured (slog.Logger) loggers
-// along with their configuration and primary writer.
+// MultLogger combines standard and structured loggers
 type MultLogger struct {
 	name             string
 	config           FileConfig
-	writer           io.Writer // The primary writer for this logger (e.g., lumberjack.Logger)
-	level            LogLevel  // Minimum level for this logger
+	writer           io.Writer
+	level            LogLevel
 	StructuredLogger *slog.Logger
 	StdLogger        *log.Logger
 
-	// New: Pre-created loggers for additional outputs
-	additionalSlogLoggers map[OutputTarget]*slog.Logger // Map target type to slog.Logger
-	additionalStdLoggers  map[OutputTarget]*log.Logger  // Map target type to log.Logger
+	additionalSlogLoggers map[OutputTarget]*slog.Logger
+	additionalStdLoggers  map[OutputTarget]*log.Logger
 }
 
-// IsEnabled checks if a given log level is enabled for this MultLogger.
 func (m *MultLogger) IsEnabled(level LogLevel) bool {
 	return level >= m.level
 }
 
-// IsStructuredActive returns true if the structured logger (slog) is active for this MultLogger.
 func (m *MultLogger) IsStructuredActive() bool {
 	return m.config.SlogWriter
 }
 
-// IsStandardActive returns true if the standard logger (log) is active for this MultLogger.
 func (m *MultLogger) IsStandardActive() bool {
 	return m.config.StdWriter
 }
 
-// Loggers holds all the different types of loggers used by the application.
+// Loggers holds all the different types of loggers
 type Loggers struct {
 	MessageLogger  *MultLogger
 	EventLogger    *MultLogger
@@ -144,52 +181,55 @@ type Loggers struct {
 	HTTPLogger     *MultLogger
 	NMMLogger      *MultLogger
 	DebugLogger    *MultLogger
-	IndexLogger    *MultLogger // New: Centralized index logger
+	IndexLogger    *MultLogger
 }
 
-// LogConfiguration holds the entire logging configuration loaded from a file.
+// LogConfiguration holds the entire logging configuration
 type LogConfiguration struct {
 	General GeneralConfig         `json:"general"`
 	Files   map[string]FileConfig `json:"files"`
 }
 
-// GeneralConfig holds general logging settings that apply across the system.
+// GeneralConfig holds general logging settings
 type GeneralConfig struct {
-	LevelsByType             map[string]string `json:"levels_by_type"` // Defines default level per type if not specified by file
+	LevelsByType             map[string]string `json:"levels_by_type"`
 	DevelopmentMode          bool              `json:"development_mode"`
 	PrettyPrint              bool              `json:"pretty_print"`
 	AddSource                bool              `json:"add_source"`
-	EnableCentralizedLogging bool              `json:"enable_centralized_logging"` // New: Enable/disable centralized logging
+	EnableCentralizedLogging bool              `json:"enable_centralized_logging"`
 	LogChannel               int               `json:"log_channel"`
+
+	// NEW: Performance tuning options
+	WorkerPoolSize      int  `json:"worker_pool_size"`      // Base worker count (default: 8)
+	MaxWorkerPoolSize   int  `json:"max_worker_pool_size"`  // Max worker count (default: 32)
+	EnableObjectPooling bool `json:"enable_object_pooling"` // Enable sync.Pool (default: true)
 }
 
-// OutputTarget specifies a target log type for additional outputs.
+// OutputTarget specifies a target log type
 type OutputTarget struct {
-	Type string `json:"type"` // The log type, e.g., "debug", "event", "message"
+	Type string `json:"type"`
 }
 
-// AdditionalOutputConfig defines where slog-formatted or std-formatted logs should also be sent.
+// AdditionalOutputConfig defines additional output targets
 type AdditionalOutputConfig struct {
-	SlogOutputs []OutputTarget `json:"slog_outputs"` // List of log types to which the slog-formatted output of THIS log type should be sent
-	StdOutputs  []OutputTarget `json:"std_outputs"`  // List of log types to which the std-formatted output of THIS log type should be sent
+	SlogOutputs []OutputTarget `json:"slog_outputs"`
+	StdOutputs  []OutputTarget `json:"std_outputs"`
 }
 
-// FileConfig holds detailed settings for an individual log file and its behavior.
+// FileConfig holds detailed settings for an individual log file
 type FileConfig struct {
-	Path       string `json:"path"`         // Full path to the log file (e.g., "logs/Error/Error.log").
-	MaxSizeMB  int    `json:"max_size_mb"`  // Maximum size of a log file before rotation, in megabytes.
-	MaxBackups int    `json:"max_backups"`  // Maximum number of old (rotated) log files to keep.
-	MaxAgeDays int    `json:"max_age_days"` // Maximum number of days to retain old log files (0 means no age limit).
-	Compress   bool   `json:"compress"`     // Whether to compress old log files (e.g., .gz).
-	MinLevel   string `json:"min_level"`    // New: Minimum log level for this specific file
+	Path       string `json:"path"`
+	MaxSizeMB  int    `json:"max_size_mb"`
+	MaxBackups int    `json:"max_backups"`
+	MaxAgeDays int    `json:"max_age_days"`
+	Compress   bool   `json:"compress"`
+	MinLevel   string `json:"min_level"`
 
-	// File format and writer configuration
-	Structured    bool `json:"structured"`      // If true, file uses JSON format; if false, uses text format (relevant for slog)
-	StdWriter     bool `json:"std_writer"`      // If true, uses standard log.Logger for file writing
-	SlogWriter    bool `json:"slog_writer"`     // If true, uses slog.Logger for file writing
-	ConsoleStd    bool `json:"console_std"`     // If true, this logger's output also goes to standard console (stdout/stderr)
-	UseFileWriter bool `json:"use_file_writer"` // If true, uses lumberjack file writer; if false, only writes to stderr
+	Structured    bool `json:"structured"`
+	StdWriter     bool `json:"std_writer"`
+	SlogWriter    bool `json:"slog_writer"`
+	ConsoleStd    bool `json:"console_std"`
+	UseFileWriter bool `json:"use_file_writer"`
 
-	// Additional outputs specific to this log type's format
 	AdditionalOutputs AdditionalOutputConfig `json:"additional_outputs"`
 }

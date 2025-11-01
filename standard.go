@@ -28,8 +28,8 @@ func dispatchLog(payload LogPayload, async bool) {
 	}
 }
 
-// LogErrorEvent logs an error event to configured loggers.
-func LogErrorEvent(ml *MessageLog, async bool, err error, message string, attr ...any) {
+// Error logs an error event to configured loggers.
+func Error(ml *MessageLog, async bool, err error, message string, attr ...any) {
 	if Testing || AppLogger == nil {
 		return
 	}
@@ -61,8 +61,8 @@ func LogErrorEvent(ml *MessageLog, async bool, err error, message string, attr .
 	}
 }
 
-// LogInfoEvent logs an info message to the message logger.
-func LogInfoEvent(ml *MessageLog, async bool, message string, attr ...any) {
+// Info logs an info message to the message logger.
+func Info(ml *MessageLog, async bool, message string, attr ...any) {
 	if Testing || AppLogger == nil {
 		return
 	}
@@ -90,8 +90,8 @@ func LogInfoEvent(ml *MessageLog, async bool, message string, attr ...any) {
 	}
 }
 
-// LogWarnEvent logs a warning message to the message logger.
-func LogWarnEvent(ml *MessageLog, async bool, message string, attr ...any) {
+// Warn logs a warning message to the message logger.
+func Warn(ml *MessageLog, async bool, message string, attr ...any) {
 	if Testing || AppLogger == nil {
 		return
 	}
@@ -119,8 +119,8 @@ func LogWarnEvent(ml *MessageLog, async bool, message string, attr ...any) {
 	}
 }
 
-// LogDebugEvent logs a debug message to the debug logger.
-func LogDebugEvent(ml *MessageLog, async bool, message string, attr ...any) {
+// Debug logs a debug message to the debug logger.
+func Debug(ml *MessageLog, async bool, message string, attr ...any) {
 	currentConfig := getConfigValue()
 	if Testing || AppLogger == nil || AppLogger.DebugLogger == nil || !currentConfig.General.DevelopmentMode {
 		return
@@ -152,8 +152,8 @@ func LogDebugEvent(ml *MessageLog, async bool, message string, attr ...any) {
 	}
 }
 
-// LogHTTPEvent logs an HTTP event to the http logger.
-func LogHTTPEvent(ml *MessageLog, async bool, message string, attr ...any) {
+// HTTP logs an HTTP event to the http logger.
+func HTTP(ml *MessageLog, async bool, message string, attr ...any) {
 	if Testing || AppLogger == nil || AppLogger.HTTPLogger == nil {
 		return
 	}
@@ -181,8 +181,8 @@ func LogHTTPEvent(ml *MessageLog, async bool, message string, attr ...any) {
 	}
 }
 
-// LogCritical logs a critical error message.
-func LogCritical(ml *MessageLog, async bool, err error, message string, attr ...any) {
+// Critical logs a critical error message.
+func Critical(ml *MessageLog, async bool, err error, message string, attr ...any) {
 	if Testing || AppLogger == nil || AppLogger.CriticalLogger == nil {
 		return
 	}
@@ -211,8 +211,8 @@ func LogCritical(ml *MessageLog, async bool, err error, message string, attr ...
 	}
 }
 
-// LogFatal logs a fatal error and exits. This must always be synchronous.
-func LogFatal(ml *MessageLog, err error, message string, attr ...any) {
+// Fatal logs a fatal error and exits. This must always be synchronous.
+func Fatal(ml *MessageLog, err error, message string, attr ...any) {
 	if Testing {
 		log.Fatalf("FATAL: %s %v", fmt.Sprintf(message, attr...), err)
 		return // Exit early in testing
@@ -245,17 +245,17 @@ func LogFatal(ml *MessageLog, err error, message string, attr ...any) {
 	os.Exit(1)
 }
 
-// LogOperationStart creates a MessageLog for operation tracking and logs the start
-func LogOperationStart(action, reffTrx, entity, typeTrx, url string) *MessageLog {
+// OperationStart creates a MessageLog for operation tracking and logs the start
+func OperationStart(action, reffTrx, entity, typeTrx, url string) *MessageLog {
 	ml := CreateMessageLog(action, reffTrx, entity, typeTrx, url)
-	LogInfoEvent(ml, true, "Operation started",
+	Info(ml, true, "Operation started",
 		slog.String("operation", "start"),
 		slog.String("operation_type", action))
 	return ml
 }
 
-// LogOperationStep logs an operation step with automatic timing and step advancement
-func LogOperationStep(ml *MessageLog, async bool, stepName, message string, attr ...any) {
+// OperationStep logs an operation step with automatic timing and step advancement
+func OperationStep(ml *MessageLog, async bool, stepName, message string, attr ...any) {
 	if ml != nil {
 		// Record current step duration and advance to next step
 		ml.RecordStepDuration()
@@ -267,15 +267,15 @@ func LogOperationStep(ml *MessageLog, async bool, stepName, message string, attr
 		}
 		stepAttrs = append(stepAttrs, attr...)
 
-		LogInfoEvent(ml, async, message, stepAttrs...)
+		Info(ml, async, message, stepAttrs...)
 	} else {
 		// Fallback if no MessageLog provided
-		LogInfoEvent(nil, async, message, attr...)
+		Info(nil, async, message, attr...)
 	}
 }
 
-// LogOperationComplete logs operation completion with comprehensive duration summary
-func LogOperationComplete(ml *MessageLog, async bool, message string, attr ...any) {
+// OperationComplete logs operation completion with comprehensive duration summary
+func OperationComplete(ml *MessageLog, async bool, message string, attr ...any) {
 	if ml != nil {
 		// Record final step duration
 		ml.RecordStepDuration()
@@ -291,14 +291,14 @@ func LogOperationComplete(ml *MessageLog, async bool, message string, attr ...an
 		}
 		completeAttrs = append(completeAttrs, attr...)
 
-		LogInfoEvent(ml, async, message, completeAttrs...)
+		Info(ml, async, message, completeAttrs...)
 	} else {
-		LogInfoEvent(nil, async, message, attr...)
+		Info(nil, async, message, attr...)
 	}
 }
 
-// LogOperationError logs an error during operation with timing context
-func LogOperationError(ml *MessageLog, async bool, err error, message string, attr ...any) {
+// OperationError logs an error during operation with timing context
+func OperationError(ml *MessageLog, async bool, err error, message string, attr ...any) {
 	if ml != nil {
 		totalDuration := ml.GetDurationSinceStart()
 		stepDuration := ml.GetDurationSinceLastLog()
@@ -311,14 +311,14 @@ func LogOperationError(ml *MessageLog, async bool, err error, message string, at
 		}
 		errorAttrs = append(errorAttrs, attr...)
 
-		LogErrorEvent(ml, async, err, message, errorAttrs...)
+		Error(ml, async, err, message, errorAttrs...)
 	} else {
-		LogErrorEvent(nil, async, err, message, attr...)
+		Error(nil, async, err, message, attr...)
 	}
 }
 
-// LogPerformanceMetric logs performance-related metrics
-func LogPerformanceMetric(ml *MessageLog, async bool, metricName string, duration time.Duration, attr ...any) {
+// PerformanceMetric logs performance-related metrics
+func PerformanceMetric(ml *MessageLog, async bool, metricName string, duration time.Duration, attr ...any) {
 	perfAttrs := []any{
 		slog.String("metric_name", metricName),
 		slog.String("metric_duration", duration.String()),
@@ -332,11 +332,11 @@ func LogPerformanceMetric(ml *MessageLog, async bool, metricName string, duratio
 	}
 
 	perfAttrs = append(perfAttrs, attr...)
-	LogInfoEvent(ml, async, "Performance metric recorded", perfAttrs...)
+	Info(ml, async, "Performance metric recorded", perfAttrs...)
 }
 
-// LogSlowOperation logs when an operation exceeds expected duration
-func LogSlowOperation(ml *MessageLog, async bool, expectedDuration, actualDuration time.Duration, message string, attr ...any) {
+// SlowOperation logs when an operation exceeds expected duration
+func SlowOperation(ml *MessageLog, async bool, expectedDuration, actualDuration time.Duration, message string, attr ...any) {
 	slowAttrs := []any{
 		slog.String("performance_alert", "slow_operation"),
 		slog.String("expected_duration", expectedDuration.String()),
@@ -345,5 +345,5 @@ func LogSlowOperation(ml *MessageLog, async bool, expectedDuration, actualDurati
 	}
 	slowAttrs = append(slowAttrs, attr...)
 
-	LogWarnEvent(ml, async, message, slowAttrs...)
+	Warn(ml, async, message, slowAttrs...)
 }
