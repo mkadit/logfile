@@ -1,63 +1,54 @@
 // logfile/util.go - Utility functions for logging operations
+// FIXED: MessageLog snapshot instead of mutation, improved caller cache
 package logfile
 
 import (
-	"context"  // For passing context to slog handlers
-	"fmt"      // For formatted string operations
-	"log/slog" // Structured logging
-	"runtime"  // For accessing call stack information
-	"strings"  // For string manipulation
-	"sync"     // For thread-safe operations
-	"time"     // For time-related operations
+	"context"
+	"fmt"
+	"log/slog"
+	"maps"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
 )
 
-// Cache for caller source information to reduce runtime.Caller overhead.
+// Caller cache variables
 var (
-	// callerCache maps program counters (PC) to formatted "file:line" strings.
+	// callerCache maps program counter (PC) to a "file:line" string.
+	// This avoids expensive runtime.FuncForPC calls on every log.
 	callerCache = make(map[uintptr]string)
-
-	// callerCacheMutex protects concurrent access to callerCache.
+	// callerCacheMutex protects the callerCache from concurrent access.
 	callerCacheMutex sync.RWMutex
-
-	// callerCacheSize limits cache size to prevent unbounded growth.
+	// callerCacheSize is the max number of entries before eviction.
 	callerCacheSize = 1000
 )
 
-// toAnySlice converts a slice of slog.Attr to []any.
-// This is a helper for functions that expect []any.
-func toAnySlice(attrs []slog.Attr) []any {
-	anySlice := make([]any, len(attrs))
-	for i, v := range attrs {
-		anySlice[i] = v
-	}
-	return anySlice
-}
-
-// deepCopyAny creates a deep copy of a value to prevent data races.
-// This is crucial when logging maps or slices from multiple goroutines,
-// as the logger may still be processing the value after the caller
-// goroutine modifies it.
+// deepCopyAny creates a deep copy of a value.
+// This is crucial for async logging to prevent data races, where the
+// calling goroutine modifies a map or slice after the log function returns,
+// but before the logger goroutine has processed it.
 func deepCopyAny(value any) any {
 	if value == nil {
 		return nil
 	}
 
-	// Type switch for efficient copying based on actual type.
 	switch v := value.(type) {
-	// Basic types are immutable or passed by value, so no copy is needed.
+	// Basic types are passed by value, so they are safe.
 	case string, int, int8, int16, int32, int64,
 		uint, uint8, uint16, uint32, uint64,
 		float32, float64, bool, time.Time, time.Duration:
 		return v
 
-	// --- Map types ---
+	// --- Reference Types: These must be copied ---
+
 	case map[string]any:
 		if len(v) == 0 {
-			return map[string]any{} // Return empty map, not nil
+			return map[string]any{}
 		}
 		copied := make(map[string]any, len(v))
 		for k, val := range v {
-			copied[k] = deepCopyAny(val) // Recursively copy values
+			copied[k] = deepCopyAny(val) // Recursive copy
 		}
 		return copied
 
@@ -65,24 +56,16 @@ func deepCopyAny(value any) any {
 		if len(v) == 0 {
 			return map[string]string{}
 		}
-		copied := make(map[string]string, len(v))
-		for k, val := range v {
-			copied[k] = val // Strings are immutable
-		}
-		return copied
+		return maps.Clone(v) // Use Go 1.21+ maps.Clone
 
 	case map[int]string:
 		if len(v) == 0 {
 			return map[int]string{}
 		}
-		copied := make(map[int]string, len(v))
-		for k, val := range v {
-			copied[k] = val
-		}
-		return copied
+		return maps.Clone(v)
 
-	// Special case for step durations, convert to string map.
 	case map[int]time.Duration:
+		// Special handling: convert to map[string]string for safer logging
 		if len(v) == 0 {
 			return map[string]string{}
 		}
@@ -92,24 +75,23 @@ func deepCopyAny(value any) any {
 		}
 		return copied
 
-	case map[int]interface{}:
+	case map[int]any:
 		if len(v) == 0 {
-			return map[int]interface{}{}
+			return map[int]any{}
 		}
-		copied := make(map[int]interface{}, len(v))
+		copied := make(map[int]any, len(v))
 		for k, val := range v {
-			copied[k] = deepCopyAny(val)
+			copied[k] = deepCopyAny(val) // Recursive copy
 		}
 		return copied
 
-	// --- Slice types ---
 	case []any:
 		if len(v) == 0 {
 			return []any{}
 		}
 		copied := make([]any, len(v))
 		for i, val := range v {
-			copied[i] = deepCopyAny(val)
+			copied[i] = deepCopyAny(val) // Recursive copy
 		}
 		return copied
 
@@ -118,7 +100,7 @@ func deepCopyAny(value any) any {
 			return []string{}
 		}
 		copied := make([]string, len(v))
-		copy(copied, v) // Efficient copy
+		copy(copied, v)
 		return copied
 
 	case []int:
@@ -126,10 +108,10 @@ func deepCopyAny(value any) any {
 			return []int{}
 		}
 		copied := make([]int, len(v))
-		copy(copied, v) // Efficient copy
+		copy(copied, v)
 		return copied
 
-	// --- Pointer types ---
+	// Pointer types: copy the underlying value
 	case *string:
 		if v == nil {
 			return nil
@@ -144,28 +126,26 @@ func deepCopyAny(value any) any {
 		i := *v
 		return &i
 
-	// --- Default ---
+	// Default: return the value as-is (e.g., custom structs).
+	// This may not be race-safe if the struct contains reference types.
 	default:
-		// For unknown complex types, return as-is.
-		// The caller is responsible for ensuring thread-safety.
 		return value
 	}
 }
 
-// getCallerSource finds the source file and line number of the *actual* log call.
-// It walks the stack, skipping frames inside the logfile package.
-// This is expensive and should only be enabled in development.
+// getCallerSource finds the source file and line number of the actual log call.
+// It walks up the stack, skipping frames inside the logfile package.
+// It uses a cache to speed up lookups.
 func getCallerSource() slog.Attr {
 	const maxDepth = 15
 
-	// Walk up the call stack.
-	for i := 2; i < maxDepth; i++ { // Start at 2 to skip runtime.Caller, getCallerSource
+	for i := 2; i < maxDepth; i++ {
 		pc, file, line, ok := runtime.Caller(i)
 		if !ok {
-			break // No more frames.
+			break
 		}
 
-		// Check cache first for this program counter.
+		// Check cache first (read lock)
 		callerCacheMutex.RLock()
 		if cached, found := callerCache[pc]; found {
 			callerCacheMutex.RUnlock()
@@ -173,22 +153,32 @@ func getCallerSource() slog.Attr {
 		}
 		callerCacheMutex.RUnlock()
 
-		// Get function info.
+		// Cache miss, get function name (expensive)
 		fn := runtime.FuncForPC(pc)
 		if fn != nil {
 			funcName := fn.Name()
 
-			// Skip internal logfile functions. We want the *caller* of logfile.
+			// Skip frames inside this package
 			if !strings.Contains(funcName, "/logfile.") &&
 				!strings.Contains(funcName, "logfile.Log") &&
 				!strings.Contains(funcName, "logfile.log") {
 
-				// Found it. Format as "file:line".
 				source := fmt.Sprintf("%s:%d", file, line)
 
-				// Cache the result.
+				// Cache with write lock (check-lock-check pattern)
 				callerCacheMutex.Lock()
-				if len(callerCache) < callerCacheSize {
+				// Check again in case another goroutine added it while we waited for the lock
+				if _, found := callerCache[pc]; !found {
+					// Evict half the cache if full
+					if len(callerCache) >= callerCacheSize {
+						for k := range callerCache {
+							delete(callerCache, k)
+							if len(callerCache) <= callerCacheSize/2 {
+								break
+							}
+						}
+					}
+					// Add to cache
 					callerCache[pc] = source
 				}
 				callerCacheMutex.Unlock()
@@ -197,14 +187,13 @@ func getCallerSource() slog.Attr {
 			}
 		}
 	}
-	// Fallback if we couldn't find the source.
+	// Fallback
 	return slog.String("source", "unknown")
 }
 
-// Flush forces any buffered logs in the logger's writer to be written.
-// This is useful for file-based writers like lumberjack.
+// Flush forces any buffered logs in the writer (e.g., lumberjack) to be written.
 func (m *MultLogger) Flush() error {
-	// Check if the writer implements a Flush() error interface.
+	// Check if the writer implements the Flusher interface
 	if flusher, ok := m.writer.(interface{ Flush() error }); ok {
 		return flusher.Flush()
 	}
@@ -212,9 +201,9 @@ func (m *MultLogger) Flush() error {
 }
 
 // FlushAll flushes all active loggers.
-// This should be called before application shutdown.
+// This is called during graceful shutdown.
 func FlushAll() error {
-	loggerMutex.RLock() // Read lock to safely access AppLogger.
+	loggerMutex.RLock() // Safe access to AppLogger
 	defer loggerMutex.RUnlock()
 
 	if AppLogger == nil {
@@ -233,105 +222,106 @@ func FlushAll() error {
 		AppLogger.IndexLogger,
 	}
 
-	// Flush each logger that exists.
+	// Iterate and flush all initialized loggers
 	for _, logger := range loggers {
 		if logger != nil {
 			if err := logger.Flush(); err != nil {
-				lastErr = err // Keep track of the last error.
+				lastErr = err // Record last error
 			}
 		}
 	}
 	return lastErr
 }
 
-// logToSpecificLogger is the internal "workhorse" function.
-// It takes a fully formed LogPayload and writes it to the
-// standard and/or structured loggers defined in the MultLogger.
+// logToSpecificLogger is the internal workhorse function that writes the log.
+// It's called synchronously by dispatchLog (for sync calls) or by logWorker (for async calls).
+// It formats the message for both structured (slog) and standard (log) writers.
 func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, err error, msg, timeNow string, ml *MessageLog, otherAttrs []any) {
-	// Early return if logger is nil or level is below threshold.
+	// Check if the logger is nil or the level is too low
 	if logger == nil || !logger.IsEnabled(level) {
 		return
 	}
 
-	// Get a reusable attribute slice from the pool.
+	// Get a reusable attribute slice from the pool
 	slogAttrsPtr := getAttrSlice()
 	slogAttrs := *slogAttrsPtr
-	defer putAttrSlice(slogAttrsPtr) // Always return to pool.
+	defer putAttrSlice(slogAttrsPtr) // Return to pool on exit
 
-	// Add standard attributes.
+	// Add base attributes
 	slogAttrs = append(slogAttrs,
 		slog.String("event_type", eventType),
 		slog.String("timestamp", timeNow),
 	)
 
-	// Add error if present.
 	if err != nil {
-		slogAttrs = append(slogAttrs, slog.String("error", err.Error()))
+		// Include stack trace if available
+		slogAttrs = append(slogAttrs, slog.String("error", fmt.Sprintf("%+v", WithStack(err))))
 	}
 
-	// Handle MessageLog context if provided.
+	// Add MessageLog attributes if present
 	var currentStepDuration time.Duration
 	if ml != nil {
-		// Record duration of the *current* step *at this exact moment*.
-		currentStepDuration = ml.SafeRecordStepDuration()
-		// Convert MessageLog fields to attributes.
-		mlAttrs := ml.ToSlogAttrs()
+		// Use the read-only snapshot method
+		currentStepDuration = ml.GetCurrentStepDurationSnapshot()
+		mlAttrs := ml.ToSlogAttrs() // Get all attributes from MessageLog
 
-		// Add step timing information.
-		if ml.Step > 1 {
+		// Add step timing information
+		currentStep := ml.GetCurrentStep()
+		if currentStep > 1 {
 			slogAttrs = append(slogAttrs,
 				slog.String("duration_step_active", currentStepDuration.String()))
 
-			// Add previous step's *completed* duration.
-			if prevDuration := ml.GetStepDuration(ml.Step - 1); prevDuration > 0 {
+			// Get duration of the previously completed step
+			if prevDuration := ml.GetStepDuration(currentStep - 1); prevDuration > 0 {
 				slogAttrs = append(slogAttrs,
 					slog.String("duration_step_completed", prevDuration.String()))
 			}
 		}
 
-		// Add performance flags for slow or complex operations.
+		// Add performance flags
 		totalDuration := ml.GetDurationSinceStart()
 		if totalDuration > time.Second {
 			slogAttrs = append(slogAttrs, slog.Bool("performance_flag_slow", true))
 		}
-		if ml.Step > 10 {
+		if currentStep > 10 {
 			slogAttrs = append(slogAttrs, slog.Bool("performance_flag_many_steps", true))
 		}
 
-		// Add all MessageLog attributes.
 		slogAttrs = append(slogAttrs, mlAttrs...)
 	}
 
-	// Process additional user-provided attributes.
+	// --- Process 'otherAttrs' (from Info, Error, etc.) ---
+
+	// This slice is for the standard (non-structured) logger
 	originalAttrsForStd := make([]any, 0, len(otherAttrs))
 	var firstComplexAttr any
 	hasComplexAttr := false
 
 	for _, a := range otherAttrs {
 		if sa, ok := a.(slog.Attr); ok {
-			// It's already an slog.Attr.
+			// It's already an slog.Attr
 			var safeValue any
+			// Deep copy if it's not a basic type
 			if isBasicType(sa.Value.Any()) {
-				safeValue = sa.Value.Any() // Basic types are safe.
+				safeValue = sa.Value.Any()
 			} else {
-				safeValue = deepCopyAny(sa.Value.Any()) // Deep copy complex types.
+				safeValue = deepCopyAny(sa.Value.Any())
 				if !hasComplexAttr {
 					firstComplexAttr = safeValue
 					hasComplexAttr = true
 				}
 			}
 
-			// Add to structured log attributes.
 			slogAttrs = append(slogAttrs, slog.Attr{
 				Key:   sa.Key,
 				Value: slog.AnyValue(safeValue),
 			})
 
-			// Format for standard (plain text) logger.
+			// Format for standard logger
 			originalAttrsForStd = append(originalAttrsForStd,
 				fmt.Sprintf("%s: %v", sa.Key, safeValue))
 		} else {
-			// It's a plain `any` value.
+			// It's a plain 'any' type, treat it as a generic argument
 			var safeCopy any
 			if isBasicType(a) {
 				safeCopy = a
@@ -350,20 +340,18 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 
 	currentConfig := getConfigValue()
 
-	// --- Write to structured logger (slog) ---
+	// --- Write to structured (slog) logger ---
 	if logger.IsStructuredActive() {
 		slogLevelToUse := level.ToSlogLevel()
 
-		// Log to primary structured logger.
 		if logger.StructuredLogger != nil {
 			logger.StructuredLogger.LogAttrs(context.Background(),
 				slogLevelToUse, msg, slogAttrs...)
 		}
 
-		// Log to additional structured outputs (redirection).
+		// Write to additional forwarded sloggers
 		for target, slogger := range logger.additionalSlogLoggers {
-			if slogger != nil {
-				// Check if this target's level is met.
+			if slogger != nil && currentConfig != nil {
 				targetConfig, ok := currentConfig.Files[target.Type]
 				if !ok {
 					continue
@@ -372,6 +360,7 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 				if err != nil {
 					continue
 				}
+				// Check if the forwarded logger's level is met
 				if level >= targetLevel {
 					slogger.LogAttrs(context.Background(), slogLevelToUse, msg, slogAttrs...)
 				}
@@ -379,21 +368,19 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 		}
 	}
 
-	// --- Write to standard logger (log.Logger) ---
+	// --- Write to standard (log) logger ---
 	if logger.IsStandardActive() {
-		// Format the log entry as a single plain-text string.
+		// Format the message for the standard logger
 		formattedMsg := formatStandardLog(msg, timeNow, eventType, err, ml,
 			originalAttrsForStd, firstComplexAttr, hasComplexAttr)
 
-		// Log to primary standard logger.
 		if logger.StdLogger != nil {
-			logger.StdLogger.Output(2, formattedMsg)
+			logger.StdLogger.Output(2, formattedMsg) // 2 = skip this frame
 		}
 
-		// Log to additional standard outputs (redirection).
+		// Write to additional forwarded standard loggers
 		for target, stdlogger := range logger.additionalStdLoggers {
-			if stdlogger != nil {
-				// Check if this target's level is met.
+			if stdlogger != nil && currentConfig != nil {
 				targetConfig, ok := currentConfig.Files[target.Type]
 				if !ok {
 					continue
@@ -402,6 +389,7 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 				if err != nil {
 					continue
 				}
+				// Check if the forwarded logger's level is met
 				if level >= targetLevel {
 					stdlogger.Output(2, formattedMsg)
 				}
@@ -410,14 +398,14 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 	}
 }
 
-// formatStandardLog creates a formatted string for standard (non-structured) logging.
+// formatStandardLog creates a formatted string for standard logging.
+// This replicates a more traditional log format.
 func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 	otherAttrs []any, firstComplexAttr any, hasComplexAttr bool,
 ) string {
-	// Pre-allocate slice for additional attributes.
 	additionalAttrs := make([]string, 0, len(otherAttrs)+3)
 
-	// Add source location if enabled.
+	// Add source if enabled
 	currentConfig := getConfigValue()
 	if currentConfig != nil && currentConfig.General.AddSource {
 		sourceAttr := getCallerSource()
@@ -425,7 +413,7 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 			fmt.Sprintf("source=%v", sourceAttr.Value.Any()))
 	}
 
-	// Add timing from MessageLog if available.
+	// Add MessageLog durations if present
 	if ml != nil {
 		if totalDuration := ml.GetDurationSinceStart(); totalDuration > 0 {
 			additionalAttrs = append(additionalAttrs,
@@ -437,7 +425,7 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 		}
 	}
 
-	// Format other attributes.
+	// Add other attributes
 	for _, a := range otherAttrs {
 		if sa, ok := a.(slog.Attr); ok {
 			additionalAttrs = append(additionalAttrs,
@@ -447,41 +435,41 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 		}
 	}
 
-	// Join attributes with spaces.
+	// Join all additional attributes
 	additionalAttrsStr := ""
 	if len(additionalAttrs) > 0 {
 		additionalAttrsStr = " " + strings.Join(additionalAttrs, " ")
 	}
 
-	// Format based on what information is available.
+	// Format with error
 	if err != nil {
-		// Error format (includes stack trace via WithStack).
 		if hasComplexAttr {
+			// Special format for complex attributes + error
 			return fmt.Sprintf("[%s][%s][%T|%+v|%s|%+v][%v]",
 				timeNow, logType, firstComplexAttr, firstComplexAttr,
 				msg, WithStack(err), additionalAttrsStr)
 		}
+		// Standard error format
 		return fmt.Sprintf("[%s][%s][%s|%+v][%v]",
 			timeNow, logType, msg, WithStack(err), additionalAttrsStr)
 	}
 
+	// Format with MessageLog context
 	if ml != nil {
-		// MessageLog format (rich context).
 		return fmt.Sprintf("[%s][%s][%s|%s][%s][%d][%s][%s][%s][%s][%s][%s][%s][%v]%s",
 			timeNow, logType, ml.InternalID, ml.Action, ml.Flow,
-			ml.Step, ml.Entity, ml.SystemName, ml.ReffTrx,
+			ml.GetCurrentStep(), ml.Entity, ml.SystemName, ml.ReffTrx,
 			ml.RC, ml.TypeTrx, ml.Header, ml.URL, msg, additionalAttrsStr)
 	}
 
-	// Simple system message format.
+	// Format for simple system message
 	if additionalAttrsStr != "" {
 		return fmt.Sprintf("[%s][SYSTEM][%s|%v]", timeNow, msg, additionalAttrsStr)
 	}
 	return fmt.Sprintf("[%s][SYSTEM][%s]", timeNow, msg)
 }
 
-// isBasicType checks if a value is a basic Go type that is immutable
-// or passed by value, making it safe for concurrent use without copying.
+// isBasicType checks if a value is a basic (non-reference) type.
 func isBasicType(val any) bool {
 	switch val.(type) {
 	case bool, int, int8, int16, int32, int64,

@@ -1,56 +1,71 @@
 // logfile/standard.go - Standard logging functions
-// This file contains the main public API functions (Info, Error, etc.)
-// that applications use to write logs.
+// FIXED: Proper MessageLog handling and channel safety
 package logfile
 
 import (
-	"fmt"      // For string formatting
-	"log"      // Standard Go logging
-	"log/slog" // Structured logging
-	"os"       // For os.Exit in Fatal
-	"time"     // For timestamps
+	"fmt"
+	"log"
+	"log/slog"
+	"os"
+	"time"
 )
 
 // dispatchLog routes a LogPayload to either the async channel or the sync logger.
-// This is the central function for deciding how a log is processed.
+// This is the central dispatcher for all log messages.
 func dispatchLog(payload LogPayload, async bool) {
+	// Check the 'async' flag passed by the user (e.g., Info(ml, true, ...))
 	if async {
-		// Asynchronous mode: Try to send to the log channel.
+		// Get channel safely
+		ch, ok := getLogChannelSafe()
+		if !ok {
+			// System is shutting down or not initialized.
+			log.Println("WARNING: Logging system not available. Log message dropped.")
+			// Return payload to pool if enabled
+			currentConfig := getConfigValue()
+			if currentConfig != nil && currentConfig.General.EnableObjectPooling {
+				putLogPayload(&payload)
+			}
+			return
+		}
+
+		// Try to send to channel in a non-blocking way
 		select {
-		case logChannel <- payload:
-			// Successfully queued the log message.
+		case ch <- payload:
+			// Successfully queued
 		default:
-			// Channel is full. Log would block.
-			// Drop the message and log a warning to stderr.
+			// Channel is full, message is dropped.
 			log.Println("WARNING: Log channel is full. Log message dropped.")
-			// Since the payload was not sent, we must return it to the pool
-			// if pooling is enabled (assuming it was retrieved from pool).
-			if Config != nil && Config.General.EnableObjectPooling {
+			// Return payload to pool if enabled
+			currentConfig := getConfigValue()
+			if currentConfig != nil && currentConfig.General.EnableObjectPooling {
 				putLogPayload(&payload)
 			}
 		}
 	} else {
-		// Synchronous mode: Write the log immediately in the current goroutine.
+		// Synchronous mode: Write immediately in the current goroutine.
 		logToSpecificLogger(
 			payload.Logger, payload.Level, payload.EventType, payload.Err,
 			payload.Msg, payload.TimeNow, payload.Ml, payload.OtherAttrs,
 		)
-		// Return the payload to the pool after synchronous write.
-		if Config != nil && Config.General.EnableObjectPooling {
+		// Return payload to pool if enabled
+		currentConfig := getConfigValue()
+		if currentConfig != nil && currentConfig.General.EnableObjectPooling {
 			putLogPayload(&payload)
 		}
 	}
 }
 
-// getPayload (internal helper) retrieves a LogPayload from the pool,
-// populating it with common data.
-func getPayload(level LogLevel, eventType string, err error, msg string, ml *MessageLog, attr []any) LogPayload {
-	// Retrieve from pool if enabled, otherwise create new.
+// getPayload retrieves a LogPayload from the pool and populates it.
+// It handles cloning the MessageLog and deep-copying attributes
+// if the log is asynchronous, to prevent data races.
+func getPayload(level LogLevel, eventType string, err error, msg string, ml *MessageLog, attr []any, async bool) LogPayload {
 	var payload *LogPayload
-	if Config != nil && Config.General.EnableObjectPooling {
-		payload = getLogPayload()
+	currentConfig := getConfigValue()
+
+	if currentConfig != nil && currentConfig.General.EnableObjectPooling {
+		payload = getLogPayload() // Get from pool
 	} else {
-		payload = &LogPayload{}
+		payload = &LogPayload{} // Allocate new
 	}
 
 	payload.Level = level
@@ -58,43 +73,82 @@ func getPayload(level LogLevel, eventType string, err error, msg string, ml *Mes
 	payload.Err = err
 	payload.Msg = msg
 	payload.TimeNow = time.Now().Format(DefaultTimeFormat)
-	payload.Ml = ml
-	// Note: We assign the slice directly. `dispatchLog` or its callee
-	// `logToSpecificLogger` is responsible for handling it.
-	// If pooling, `OtherAttrs` should be copied if the slice is reused.
-	// *Correction*: The current implementation passes the `attr` slice directly.
-	// `putLogPayload` will clear `OtherAttrs`, which is fine as it's
-	// the `LogPayload` being pooled, not the `attr` slice itself.
-	payload.OtherAttrs = attr
+
+	// CRITICAL FIX: If logging asynchronously, we *must* clone the MessageLog.
+	// Otherwise, the logger worker goroutine will read it at the same time
+	// the main goroutine is modifying it (e.g., in OperationStep).
+	if async && ml != nil {
+		payload.Ml = ml.Clone()
+	} else {
+		// If sync, we can just pass the pointer.
+		payload.Ml = ml
+	}
+
+	// Deep copy attributes for async logging to prevent data races
+	// if the caller modifies the underlying slice/map after logging.
+	if async && len(attr) > 0 {
+		payload.OtherAttrs = deepCopyAttrs(attr)
+	} else {
+		payload.OtherAttrs = attr
+	}
+
 	return *payload
 }
 
+// deepCopyAttrs creates a deep copy of attributes for async logging.
+// This is a defensive copy to prevent data races.
+func deepCopyAttrs(attr []any) []any {
+	if len(attr) == 0 {
+		return nil
+	}
+
+	copied := make([]any, len(attr))
+	for i, a := range attr {
+		if sa, ok := a.(slog.Attr); ok {
+			// Deep copy the attribute value
+			copied[i] = slog.Attr{
+				Key: sa.Key,
+				// slog.AnyValue handles the value encapsulation
+				Value: slog.AnyValue(deepCopyAny(sa.Value.Any())),
+			}
+		} else {
+			// Deep copy other 'any' types
+			copied[i] = deepCopyAny(a)
+		}
+	}
+	return copied
+}
+
 // Error logs an error event.
-// It logs to EventLogger, ErrorLogger, and optionally IndexLogger.
+// It writes to EventLogger, ErrorLogger, and (if enabled) IndexLogger.
 func Error(ml *MessageLog, async bool, err error, message string, attr ...any) {
-	if Testing || AppLogger == nil {
+	if Testing || !isLoggerActive() {
 		return
 	}
 
-	loggerMutex.RLock() // Read lock to safely access AppLogger.
+	loggerMutex.RLock() // Read lock to safely access AppLogger
 	defer loggerMutex.RUnlock()
 
-	// Base payload for error.
-	payload := getPayload(LevelError, "error", err, message, ml, attr)
+	if AppLogger == nil {
+		return
+	}
 
-	// Log to EventLogger if configured.
+	// Get a payload (clones/copies if async)
+	payload := getPayload(LevelError, "error", err, message, ml, attr, async)
+
+	// Dispatch to EventLogger
 	if AppLogger.EventLogger != nil {
 		payload.Logger = AppLogger.EventLogger
 		dispatchLog(payload, async)
 	}
 
-	// Log to ErrorLogger if configured.
+	// Dispatch to ErrorLogger
 	if AppLogger.ErrorLogger != nil {
 		payload.Logger = AppLogger.ErrorLogger
 		dispatchLog(payload, async)
 	}
 
-	// If centralized logging is enabled, also log to IndexLogger.
+	// Dispatch to centralized IndexLogger
 	currentConfig := getConfigValue()
 	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
 		payload.Logger = AppLogger.IndexLogger
@@ -103,47 +157,59 @@ func Error(ml *MessageLog, async bool, err error, message string, attr ...any) {
 }
 
 // Info logs an informational message.
-// It logs to EventLogger and optionally IndexLogger.
+// It writes to EventLogger and (if enabled) IndexLogger.
 func Info(ml *MessageLog, async bool, message string, attr ...any) {
-	if Testing || AppLogger == nil {
+	if Testing || !isLoggerActive() {
 		return
 	}
+
 	loggerMutex.RLock()
 	defer loggerMutex.RUnlock()
 
-	payload := getPayload(LevelInfo, "info", nil, message, ml, attr)
+	if AppLogger == nil {
+		return
+	}
 
-	// Log to EventLogger.
+	payload := getPayload(LevelInfo, "info", nil, message, ml, attr, async)
+
+	// Dispatch to EventLogger
 	if AppLogger.EventLogger != nil {
 		payload.Logger = AppLogger.EventLogger
 		dispatchLog(payload, async)
 	}
 
-	// If centralized logging enabled, also send to IndexLogger.
+	// Dispatch to centralized IndexLogger
 	currentConfig := getConfigValue()
 	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
 		payload.Logger = AppLogger.IndexLogger
-		payload.EventType = "index" // Change event type for index.
+		payload.EventType = "index" // Mark as 'index' type for this logger
 		dispatchLog(payload, async)
 	}
 }
 
 // Warn logs a warning message.
-// It logs to EventLogger and optionally IndexLogger.
+// It writes to EventLogger and (if enabled) IndexLogger.
 func Warn(ml *MessageLog, async bool, message string, attr ...any) {
-	if Testing || AppLogger == nil {
+	if Testing || !isLoggerActive() {
 		return
 	}
+
 	loggerMutex.RLock()
 	defer loggerMutex.RUnlock()
 
-	payload := getPayload(LevelWarn, "warn", nil, message, ml, attr)
+	if AppLogger == nil {
+		return
+	}
 
+	payload := getPayload(LevelWarn, "warn", nil, message, ml, attr, async)
+
+	// Dispatch to EventLogger
 	if AppLogger.EventLogger != nil {
 		payload.Logger = AppLogger.EventLogger
 		dispatchLog(payload, async)
 	}
 
+	// Dispatch to centralized IndexLogger
 	currentConfig := getConfigValue()
 	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
 		payload.Logger = AppLogger.IndexLogger
@@ -153,55 +219,68 @@ func Warn(ml *MessageLog, async bool, message string, attr ...any) {
 }
 
 // Debug logs detailed debugging information.
-// It only logs if DevelopmentMode is enabled in the configuration.
+// It only logs if DevelopmentMode is true.
+// It writes to EventLogger, DebugLogger, and (if enabled) IndexLogger.
 func Debug(ml *MessageLog, async bool, message string, attr ...any) {
 	currentConfig := getConfigValue()
 
-	// Skip if testing, logger not initialized, no debug logger, or not in dev mode.
-	if Testing || AppLogger == nil || AppLogger.DebugLogger == nil || !currentConfig.General.DevelopmentMode {
+	// Exit early if not in development mode
+	if Testing || !isLoggerActive() || currentConfig == nil || !currentConfig.General.DevelopmentMode {
 		return
 	}
 
 	loggerMutex.RLock()
 	defer loggerMutex.RUnlock()
 
-	payload := getPayload(LevelDebug, "debug", nil, message, ml, attr)
+	if AppLogger == nil || AppLogger.DebugLogger == nil {
+		return
+	}
 
-	// Log to EventLogger.
+	payload := getPayload(LevelDebug, "debug", nil, message, ml, attr, async)
+
+	// Dispatch to EventLogger
 	if AppLogger.EventLogger != nil {
 		payload.Logger = AppLogger.EventLogger
 		dispatchLog(payload, async)
 	}
 
-	// Log to DebugLogger.
+	// Dispatch to DebugLogger
 	if AppLogger.DebugLogger != nil {
 		payload.Logger = AppLogger.DebugLogger
 		dispatchLog(payload, async)
 	}
 
-	// Also send to IndexLogger if centralized logging enabled.
-	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
+	// Dispatch to centralized IndexLogger
+	if currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
 		payload.Logger = AppLogger.IndexLogger
 		payload.EventType = "index"
 		dispatchLog(payload, async)
 	}
 }
 
-// HTTP logs HTTP-related events (e.g., requests, responses).
+// HTTP logs HTTP-related events.
+// It writes to HTTPLogger and (if enabled) IndexLogger.
 func HTTP(ml *MessageLog, async bool, message string, attr ...any) {
-	if Testing || AppLogger == nil || AppLogger.HTTPLogger == nil {
+	if Testing || !isLoggerActive() {
 		return
 	}
+
 	loggerMutex.RLock()
 	defer loggerMutex.RUnlock()
 
-	payload := getPayload(LevelInfo, "http", nil, message, ml, attr)
+	if AppLogger == nil || AppLogger.HTTPLogger == nil {
+		return
+	}
 
+	payload := getPayload(LevelInfo, "http", nil, message, ml, attr, async)
+
+	// Dispatch to HTTPLogger
 	if AppLogger.HTTPLogger != nil {
 		payload.Logger = AppLogger.HTTPLogger
 		dispatchLog(payload, async)
 	}
 
+	// Dispatch to centralized IndexLogger
 	currentConfig := getConfigValue()
 	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
 		payload.Logger = AppLogger.IndexLogger
@@ -210,21 +289,29 @@ func HTTP(ml *MessageLog, async bool, message string, attr ...any) {
 	}
 }
 
-// Critical logs a critical error that requires immediate attention.
+// Critical logs a critical error.
+// It writes to CriticalLogger and (if enabled) IndexLogger.
 func Critical(ml *MessageLog, async bool, err error, message string, attr ...any) {
-	if Testing || AppLogger == nil || AppLogger.CriticalLogger == nil {
+	if Testing || !isLoggerActive() {
 		return
 	}
+
 	loggerMutex.RLock()
 	defer loggerMutex.RUnlock()
 
-	payload := getPayload(LevelCritical, "critical", err, message, ml, attr)
+	if AppLogger == nil || AppLogger.CriticalLogger == nil {
+		return
+	}
 
+	payload := getPayload(LevelCritical, "critical", err, message, ml, attr, async)
+
+	// Dispatch to CriticalLogger
 	if AppLogger.CriticalLogger != nil {
 		payload.Logger = AppLogger.CriticalLogger
 		dispatchLog(payload, async)
 	}
 
+	// Dispatch to centralized IndexLogger
 	currentConfig := getConfigValue()
 	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
 		payload.Logger = AppLogger.IndexLogger
@@ -233,44 +320,49 @@ func Critical(ml *MessageLog, async bool, err error, message string, attr ...any
 	}
 }
 
-// Fatal logs a fatal error and terminates the application with os.Exit(1).
-// This function *always* logs synchronously to ensure the message is written.
+// Fatal logs a fatal error and terminates the application.
+// This function ALWAYS logs synchronously to ensure messages are written.
+// It writes to CriticalLogger, IndexLogger, then calls Shutdown() and os.Exit(1).
 func Fatal(ml *MessageLog, err error, message string, attr ...any) {
-	// In testing mode, use standard log.Fatalf to stop the test.
 	if Testing {
+		// In tests, just log to stderr and return to allow test to fail
 		log.Fatalf("FATAL: %s %v", fmt.Sprintf(message, attr...), err)
 		return
 	}
 
-	payload := getPayload(LevelCritical, "fatal", err, message, ml, attr)
+	// ALWAYS log synchronously for Fatal
+	payload := getPayload(LevelCritical, "fatal", err, message, ml, attr, false)
 
-	// ALWAYS log synchronously (async=false).
+	loggerMutex.RLock()
+	// Dispatch to CriticalLogger
 	if AppLogger != nil && AppLogger.CriticalLogger != nil {
 		payload.Logger = AppLogger.CriticalLogger
-		dispatchLog(payload, false)
+		dispatchLog(payload, false) // false = synchronous
 	}
 
+	// Dispatch to centralized IndexLogger
 	currentConfig := getConfigValue()
 	if AppLogger != nil && currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
 		payload.Logger = AppLogger.IndexLogger
-		dispatchLog(payload, false)
+		dispatchLog(payload, false) // false = synchronous
 	}
+	loggerMutex.RUnlock()
 
-	// Flush all buffered logs before exiting.
+	// Flush all buffered logs before exiting
 	Shutdown()
 
-	// Terminate the application.
+	// Terminate the application
 	os.Exit(1)
 }
 
 // OperationStart creates a new MessageLog and logs the start of an operation.
-// This is the entry point for tracking a multi-step workflow.
+// This is a helper function to standardize operation logging.
 func OperationStart(action, reffTrx, entity, typeTrx, url string) *MessageLog {
-	// Create the MessageLog to track this operation.
+	// Create a new context for this operation
 	ml := CreateMessageLog(action, reffTrx, entity, typeTrx, url)
 
-	// Log the start event.
-	Info(ml, true, "Operation started",
+	// Log the start event
+	Info(ml, true, "Operation started", // true = async
 		slog.String("operation", "start"),
 		slog.String("operation_type", action))
 
@@ -278,43 +370,43 @@ func OperationStart(action, reffTrx, entity, typeTrx, url string) *MessageLog {
 }
 
 // OperationStep logs a step within an ongoing operation.
-// It automatically records the timing of the *previous* step and advances
-// the MessageLog to the *next* step.
+// It modifies the MessageLog by recording the step duration.
+// IMPORTANT: This modifies ml.Step, so don't use the same ml concurrently
+// without cloning. The 'async' flag handles cloning in getPayload.
 func OperationStep(ml *MessageLog, async bool, stepName, message string, attr ...any) {
 	if ml != nil {
-		// Record how long the previous step took and advance to the next step.
+		// Record the duration of the *previous* step
 		ml.RecordStepDuration()
 
-		// Add step information to the log attributes.
+		// Prepare attributes for this step
 		stepAttrs := []any{
 			slog.String("step_name", stepName),
-			slog.Int("step_number", ml.Step), // ml.Step is now the *new* step number.
+			slog.Int("step_number", ml.GetCurrentStep()),
 		}
 		stepAttrs = append(stepAttrs, attr...)
 
-		// Log the step.
 		Info(ml, async, message, stepAttrs...)
 	} else {
-		// Fallback if no MessageLog provided.
+		// Log without operation context
 		Info(nil, async, message, attr...)
 	}
 }
 
 // OperationComplete logs the successful completion of an operation.
-// It records the duration of the final step and logs a summary.
+// It records the final step duration and logs a summary.
 func OperationComplete(ml *MessageLog, async bool, message string, attr ...any) {
 	if ml != nil {
-		// Record the duration of the final step.
+		// Record duration of the final step
 		ml.RecordStepDuration()
 
 		totalDuration := ml.GetDurationSinceStart()
-		durationSummary := ml.GetDurationSummary() // Get summary map.
+		durationSummary := ml.GetDurationSummary() // Get map[int]duration
 
-		// Build attributes with completion information.
+		// Prepare summary attributes
 		completeAttrs := []any{
 			slog.String("operation", "complete"),
 			slog.String("total_duration", totalDuration.String()),
-			slog.Int("total_steps", ml.Step), // Step counter was advanced by RecordStepDuration
+			slog.Int("total_steps", ml.GetCurrentStep()),
 			slog.Any("duration_summary", durationSummary),
 		}
 		completeAttrs = append(completeAttrs, attr...)
@@ -326,18 +418,19 @@ func OperationComplete(ml *MessageLog, async bool, message string, attr ...any) 
 }
 
 // OperationError logs an error that occurred during an operation.
-// It includes timing context up to the point of failure.
+// It logs the total duration and at which step the error occurred.
 func OperationError(ml *MessageLog, async bool, err error, message string, attr ...any) {
 	if ml != nil {
-		// Get timing information up to the point of failure.
 		totalDuration := ml.GetDurationSinceStart()
-		stepDuration := ml.GetDurationSinceLastLog() // Duration of the failing step.
+		// Get duration since the last step
+		stepDuration := ml.GetDurationSinceLastLog()
 
+		// Prepare error attributes
 		errorAttrs := []any{
 			slog.String("operation", "error"),
 			slog.String("total_duration", totalDuration.String()),
 			slog.String("step_duration", stepDuration.String()),
-			slog.Int("failed_at_step", ml.Step), // The step number *during* which it failed.
+			slog.Int("failed_at_step", ml.GetCurrentStep()),
 		}
 		errorAttrs = append(errorAttrs, attr...)
 
@@ -347,20 +440,20 @@ func OperationError(ml *MessageLog, async bool, err error, message string, attr 
 	}
 }
 
-// PerformanceMetric logs a specific performance measurement (e.g., a DB query).
+// PerformanceMetric logs a specific performance measurement.
+// This is for logging arbitrary durations that aren't part of a formal "step".
 func PerformanceMetric(ml *MessageLog, async bool, metricName string, duration time.Duration, attr ...any) {
-	// Build attributes with metric information.
 	perfAttrs := []any{
 		slog.String("metric_name", metricName),
 		slog.String("metric_duration", duration.String()),
 		slog.String("metric_type", "performance"),
 	}
 
-	// If we have operation context, add it.
+	// Add operation context if available
 	if ml != nil {
 		perfAttrs = append(perfAttrs,
 			slog.String("context_total_duration", ml.GetDurationSinceStart().String()),
-			slog.Int("context_step", ml.Step))
+			slog.Int("context_step", ml.GetCurrentStep()))
 	}
 
 	perfAttrs = append(perfAttrs, attr...)
@@ -369,7 +462,6 @@ func PerformanceMetric(ml *MessageLog, async bool, metricName string, duration t
 
 // SlowOperation logs a warning when an operation exceeds an expected duration.
 func SlowOperation(ml *MessageLog, async bool, expectedDuration, actualDuration time.Duration, message string, attr ...any) {
-	// Calculate how much slower than expected.
 	slownessRatio := 0.0
 	if expectedDuration > 0 {
 		slownessRatio = actualDuration.Seconds() / expectedDuration.Seconds()
@@ -379,10 +471,9 @@ func SlowOperation(ml *MessageLog, async bool, expectedDuration, actualDuration 
 		slog.String("performance_alert", "slow_operation"),
 		slog.String("expected_duration", expectedDuration.String()),
 		slog.String("actual_duration", actualDuration.String()),
-		slog.Float64("slowness_ratio", slownessRatio), // e.g., 2.5 means 2.5x slower
+		slog.Float64("slowness_ratio", slownessRatio),
 	}
 	slowAttrs = append(slowAttrs, attr...)
 
-	// Log as a warning.
 	Warn(ml, async, message, slowAttrs...)
 }

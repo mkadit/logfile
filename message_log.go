@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sync"
 	"time"
 
@@ -12,49 +13,37 @@ import (
 )
 
 const (
-	// ContextMessageKey is a key used to store and retrieve a MessageLog
-	// from a context.Context.
-	ContextMessageKey = "LogfileContextMsgKey"
-
-	// defaultStepCapacity is a pre-allocation hint for the StepDurations map.
-	// It avoids multiple map re-allocations for typical operations.
-	defaultStepCapacity = 50 // Pre-allocate for 50 steps
+	ContextMessageKey   = "LogfileContextMsgKey"
+	defaultStepCapacity = 50
 )
 
-// ErrMissingMessage indicates that a log message was expected but not provided.
 var ErrMissingMessage = errors.New("error missing log message")
 
 // MessageLog tracks the state and timing of a multi-step operation or transaction.
-// It is designed to be passed through an operation's lifecycle to provide
-// consistent, contextual logging.
+// THREAD-SAFETY: All methods are thread-safe. Use Clone() when passing to async operations.
 type MessageLog struct {
-	InternalID string `json:"internal_id"` // Unique ID for this log entry/operation.
-	Action     string `json:"action"`      // Name of the operation (e.g., "ProcessPayment").
-	Flow       string `json:"flow"`        // Direction of data (e.g., "IN" or "OUT").
-	Step       int    `json:"step"`        // The current step number in the operation.
-	Entity     string `json:"entity"`      // The service or component performing the action.
-	SystemName string `json:"system_name"` // The name of the overall application.
-	ReffTrx    string `json:"reff_trx"`    // External transaction reference ID.
-	RC         string `json:"rc"`          // Response code.
-	TypeTrx    string `json:"type_trx"`    // Type of transaction (e.g., "CREDIT").
-	Header     string `json:"header"`      // Associated header data (e.g., HTTP headers).
-	URL        string `json:"url"`         // URL associated with the operation.
-	Msg        string `json:"msg"`         // A base message for the operation.
+	InternalID string `json:"internal_id"`
+	Action     string `json:"action"`
+	Flow       string `json:"flow"`
+	Step       int    `json:"step"`
+	Entity     string `json:"entity"`
+	SystemName string `json:"system_name"`
+	ReffTrx    string `json:"reff_trx"`
+	RC         string `json:"rc"`
+	TypeTrx    string `json:"type_trx"`
+	Header     string `json:"header"`
+	URL        string `json:"url"`
+	Msg        string `json:"msg"`
 
-	StartTime time.Time `json:"start_time"` // When the operation started.
-	LastTime  time.Time `json:"last_time"`  // When the last step was recorded.
+	StartTime time.Time `json:"start_time"`
+	LastTime  time.Time `json:"last_time"`
 
-	// StepDurations stores the duration of each completed step.
-	// The key is the step number.
 	StepDurations map[int]time.Duration `json:"step_durations,omitempty"`
-	// mu protects fields that are modified during the operation (Step, LastTime, StepDurations).
-	mu sync.RWMutex `json:"-"`
+	mu            sync.RWMutex          `json:"-"`
 }
 
-// CreateMessageLog creates and initializes a new MessageLog for tracking an operation.
 func CreateMessageLog(action string, reffTrx string, entity string, typeTrx string, url string) *MessageLog {
 	httpString := "request from"
-	// Generate a unique internal ID for this operation.
 	ctxReqID := uuid.New().String()
 	msg := fmt.Sprintf("%s %s (%s):", httpString, entity, url)
 	now := time.Now()
@@ -63,8 +52,8 @@ func CreateMessageLog(action string, reffTrx string, entity string, typeTrx stri
 		SystemName:    SystemName,
 		InternalID:    ctxReqID,
 		Action:        action,
-		Flow:          "IN", // Default flow is "IN"
-		Step:          1,    // Start at step 1
+		Flow:          "IN",
+		Step:          1,
 		Entity:        entity,
 		ReffTrx:       reffTrx,
 		TypeTrx:       typeTrx,
@@ -72,12 +61,12 @@ func CreateMessageLog(action string, reffTrx string, entity string, typeTrx stri
 		Msg:           msg,
 		StartTime:     now,
 		LastTime:      now,
-		StepDurations: make(map[int]time.Duration, defaultStepCapacity), // Pre-allocate map
+		StepDurations: make(map[int]time.Duration, defaultStepCapacity),
 	}
 }
 
 // UpdateMessageLog updates the state of the MessageLog for a new phase or flow.
-// It records the duration of the *previous* step before updating.
+// CRITICAL: This modifies the MessageLog. Do not call during async logging.
 func (ml *MessageLog) UpdateMessageLog(flow string, entity string, typeTrx string) {
 	if ml == nil {
 		return
@@ -90,14 +79,11 @@ func (ml *MessageLog) UpdateMessageLog(flow string, entity string, typeTrx strin
 	ml.Entity = entity
 	ml.TypeTrx = typeTrx
 
-	// Ensure the map is initialized (should be by CreateMessageLog, but good practice).
 	if ml.StepDurations == nil {
 		ml.StepDurations = make(map[int]time.Duration, defaultStepCapacity)
 	}
-	// Record the duration of the step that is *ending*.
 	ml.StepDurations[ml.Step] = ml.getDurationSinceLastLogUnsafe()
 
-	// Advance to the next step and reset the timer.
 	ml.Step++
 	ml.LastTime = time.Now()
 
@@ -107,18 +93,16 @@ func (ml *MessageLog) UpdateMessageLog(flow string, entity string, typeTrx strin
 		httpString = "outgoing data"
 	}
 
-	// Update the base message.
 	msg := fmt.Sprintf("%s %s (%s):", httpString, entity, ml.URL)
 	ml.Flow = flow
 	ml.Msg = msg
 }
 
-// GetDurationSinceStart returns the total duration since the MessageLog was created.
 func (ml *MessageLog) GetDurationSinceStart() time.Duration {
 	if ml == nil {
 		return 0
 	}
-	ml.mu.RLock() // Use read lock for safety.
+	ml.mu.RLock()
 	defer ml.mu.RUnlock()
 
 	if ml.StartTime.IsZero() {
@@ -127,8 +111,6 @@ func (ml *MessageLog) GetDurationSinceStart() time.Duration {
 	return time.Since(ml.StartTime)
 }
 
-// GetDurationSinceLastLog returns the duration since the last step was recorded.
-// This represents the duration of the *current, active* step.
 func (ml *MessageLog) GetDurationSinceLastLog() time.Duration {
 	if ml == nil {
 		return 0
@@ -139,8 +121,6 @@ func (ml *MessageLog) GetDurationSinceLastLog() time.Duration {
 	return ml.getDurationSinceLastLogUnsafe()
 }
 
-// getDurationSinceLastLogUnsafe is the internal, non-locking version of GetDurationSinceLastLog.
-// It should only be called by methods that already hold the mutex.
 func (ml *MessageLog) getDurationSinceLastLogUnsafe() time.Duration {
 	if ml.LastTime.IsZero() {
 		return 0
@@ -148,7 +128,6 @@ func (ml *MessageLog) getDurationSinceLastLogUnsafe() time.Duration {
 	return time.Since(ml.LastTime)
 }
 
-// GetStepDuration returns the recorded duration for a specific *completed* step.
 func (ml *MessageLog) GetStepDuration(step int) time.Duration {
 	if ml == nil {
 		return 0
@@ -159,18 +138,25 @@ func (ml *MessageLog) GetStepDuration(step int) time.Duration {
 	if ml.StepDurations == nil {
 		return 0
 	}
-	// Reading from a map is thread-safe for concurrent reads, but
-	// we use RLock for consistency with other methods.
 	return ml.StepDurations[step]
 }
 
-// GetCurrentStepDuration is an alias for GetDurationSinceLastLog.
 func (ml *MessageLog) GetCurrentStepDuration() time.Duration {
 	return ml.GetDurationSinceLastLog()
 }
 
-// UpdateLastTime updates the LastTime to time.Now().
-// This is used to "reset" the step timer without advancing the step counter.
+// GetCurrentStepDurationSnapshot returns the duration WITHOUT modifying MessageLog.
+// USE THIS in logging functions to avoid race conditions.
+func (ml *MessageLog) GetCurrentStepDurationSnapshot() time.Duration {
+	if ml == nil {
+		return 0
+	}
+	ml.mu.RLock()
+	defer ml.mu.RUnlock()
+
+	return ml.getDurationSinceLastLogUnsafe()
+}
+
 func (ml *MessageLog) UpdateLastTime() {
 	if ml == nil {
 		return
@@ -182,6 +168,7 @@ func (ml *MessageLog) UpdateLastTime() {
 }
 
 // RecordStepDuration records the duration of the current step and advances to the next.
+// CRITICAL: This modifies the MessageLog. Do not call during async logging.
 func (ml *MessageLog) RecordStepDuration() {
 	if ml == nil {
 		return
@@ -194,65 +181,42 @@ func (ml *MessageLog) RecordStepDuration() {
 		ml.StepDurations = make(map[int]time.Duration, defaultStepCapacity)
 	}
 
-	// Record duration of the step that just finished.
 	ml.StepDurations[ml.Step] = ml.getDurationSinceLastLogUnsafe()
-	// Advance to the next step.
 	ml.Step++
-	// Reset the timer for the new step.
 	ml.LastTime = time.Now()
 }
 
-// SafeRecordStepDuration records the duration, advances the step, and returns the duration
-// that was just recorded.
+// DEPRECATED: Use GetCurrentStepDurationSnapshot() instead for logging.
+// This method was previously unsafe and modified LastTime during logging.
 func (ml *MessageLog) SafeRecordStepDuration() time.Duration {
+	return ml.GetCurrentStepDurationSnapshot()
+}
+
+// GetCurrentStep returns the current step number (thread-safe read).
+func (ml *MessageLog) GetCurrentStep() int {
 	if ml == nil {
 		return 0
 	}
-
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-
-	if ml.StepDurations == nil {
-		ml.StepDurations = make(map[int]time.Duration, defaultStepCapacity)
-	}
-
-	// Get duration before resetting LastTime.
-	duration := ml.getDurationSinceLastLogUnsafe()
-	ml.StepDurations[ml.Step] = ml.StepDurations[ml.Step] + duration
-	// Note: This function does not increment ml.Step.
-	// This is a subtle difference from RecordStepDuration.
-	// Based on its use in `logToSpecificLogger`, this function is
-	// *only* for recording the *current* step's duration *at the time of logging*.
-	ml.LastTime = time.Now()
-
-	return duration
+	ml.mu.RLock()
+	defer ml.mu.RUnlock()
+	return ml.Step
 }
 
-// Clone creates a thread-safe deep copy of the MessageLog.
-// This is useful for passing a snapshot of the log to another goroutine.
 func (ml *MessageLog) Clone() *MessageLog {
 	if ml == nil {
 		return nil
 	}
 
-	ml.mu.RLock() // Use read lock while copying.
+	ml.mu.RLock()
 	defer ml.mu.RUnlock()
 
-	// Determine capacity for the new map.
-	capacity := len(ml.StepDurations)
-	if capacity < defaultStepCapacity {
-		capacity = defaultStepCapacity
-	}
+	capacity := max(len(ml.StepDurations), defaultStepCapacity)
 
-	// Create a new map and deep copy the durations.
 	stepDurations := make(map[int]time.Duration, capacity)
 	if ml.StepDurations != nil {
-		for k, v := range ml.StepDurations {
-			stepDurations[k] = v
-		}
+		maps.Copy(stepDurations, ml.StepDurations)
 	}
 
-	// Return a new MessageLog struct with copied values.
 	return &MessageLog{
 		InternalID:    ml.InternalID,
 		Action:        ml.Action,
@@ -269,11 +233,9 @@ func (ml *MessageLog) Clone() *MessageLog {
 		StartTime:     ml.StartTime,
 		LastTime:      ml.LastTime,
 		StepDurations: stepDurations,
-		// Note: The new copy has its own mutex, initialized to zero value.
 	}
 }
 
-// WithStep returns a *clone* of the MessageLog with the Step field updated.
 func (ml *MessageLog) WithStep(step int) *MessageLog {
 	clone := ml.Clone()
 	if clone != nil {
@@ -282,7 +244,6 @@ func (ml *MessageLog) WithStep(step int) *MessageLog {
 	return clone
 }
 
-// WithFlow returns a *clone* of the MessageLog with the Flow field updated.
 func (ml *MessageLog) WithFlow(flow string) *MessageLog {
 	clone := ml.Clone()
 	if clone != nil {
@@ -291,7 +252,6 @@ func (ml *MessageLog) WithFlow(flow string) *MessageLog {
 	return clone
 }
 
-// WithEntity returns a *clone* of the MessageLog with the Entity field updated.
 func (ml *MessageLog) WithEntity(entity string) *MessageLog {
 	clone := ml.Clone()
 	if clone != nil {
@@ -300,7 +260,6 @@ func (ml *MessageLog) WithEntity(entity string) *MessageLog {
 	return clone
 }
 
-// WithRC returns a *clone* of the MessageLog with the RC (Response Code) field updated.
 func (ml *MessageLog) WithRC(rc string) *MessageLog {
 	clone := ml.Clone()
 	if clone != nil {
@@ -309,7 +268,6 @@ func (ml *MessageLog) WithRC(rc string) *MessageLog {
 	return clone
 }
 
-// WithFeature returns a *clone* of the MessageLog with the Action and URL fields updated.
 func (ml *MessageLog) WithFeature(action string, url string) *MessageLog {
 	clone := ml.Clone()
 	if clone != nil {
@@ -319,20 +277,16 @@ func (ml *MessageLog) WithFeature(action string, url string) *MessageLog {
 	return clone
 }
 
-// ToSlogAttrs converts the MessageLog's fields into a slice of slog.Attr
-// for structured logging. This is a thread-safe operation.
 func (m *MessageLog) ToSlogAttrs() []slog.Attr {
 	if m == nil {
 		return []slog.Attr{}
 	}
 
-	m.mu.RLock() // Use read lock.
+	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Pre-allocate slice with a reasonable capacity.
 	attrs := make([]slog.Attr, 0, 15)
 
-	// Add all non-empty fields as attributes.
 	if m.InternalID != "" {
 		attrs = append(attrs, slog.String("internal_id", m.InternalID))
 	}
@@ -367,13 +321,11 @@ func (m *MessageLog) ToSlogAttrs() []slog.Attr {
 		attrs = append(attrs, slog.String("url", m.URL))
 	}
 
-	// Add total duration.
 	if !m.StartTime.IsZero() {
 		attrs = append(attrs, slog.String("duration_total", time.Since(m.StartTime).String()))
 	}
 
-	// Add step durations as a map[string]string for clean logging.
-	if m.StepDurations != nil && len(m.StepDurations) > 0 {
+	if len(m.StepDurations) > 0 {
 		stepDurationsCopy := make(map[string]string, len(m.StepDurations))
 		for step, duration := range m.StepDurations {
 			stepDurationsCopy[fmt.Sprintf("step_%d", step)] = duration.String()
@@ -384,13 +336,9 @@ func (m *MessageLog) ToSlogAttrs() []slog.Attr {
 	return attrs
 }
 
-// ToSlogAttrsWithCustomDuration is a convenience function to append
-// custom duration metrics to the standard MessageLog attributes.
 func (m *MessageLog) ToSlogAttrsWithCustomDuration(customDurations map[string]time.Duration) []slog.Attr {
-	// Get the base attributes.
 	attrs := m.ToSlogAttrs()
 
-	// Add custom durations.
 	for key, duration := range customDurations {
 		attrs = append(attrs, slog.String(fmt.Sprintf("duration_%s", key), duration.String()))
 	}
@@ -398,9 +346,7 @@ func (m *MessageLog) ToSlogAttrsWithCustomDuration(customDurations map[string]ti
 	return attrs
 }
 
-// GetDurationSummary returns a thread-safe map summarizing all step durations.
-// The map is suitable for logging as a structured attribute.
-func (ml *MessageLog) GetDurationSummary() map[string]interface{} {
+func (ml *MessageLog) GetDurationSummary() map[string]any {
 	if ml == nil {
 		return nil
 	}
@@ -408,14 +354,12 @@ func (ml *MessageLog) GetDurationSummary() map[string]interface{} {
 	ml.mu.RLock()
 	defer ml.mu.RUnlock()
 
-	// Create the summary map.
-	summary := make(map[string]interface{}, 4)
+	summary := make(map[string]any, 4)
 	summary["total_duration"] = time.Since(ml.StartTime).String()
 	summary["current_step_duration"] = ml.getDurationSinceLastLogUnsafe().String()
 	summary["current_step"] = ml.Step
 
-	// Create a copy of step durations, formatted as strings.
-	if ml.StepDurations != nil && len(ml.StepDurations) > 0 {
+	if len(ml.StepDurations) > 0 {
 		stepDurations := make(map[string]string, len(ml.StepDurations))
 		for step, duration := range ml.StepDurations {
 			stepDurations[fmt.Sprintf("step_%d", step)] = duration.String()

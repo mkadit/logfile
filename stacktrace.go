@@ -24,12 +24,13 @@ var stackPool = sync.Pool{
 	},
 }
 
-// Frame represents a single program counter inside a stack frame.
+// Frame represents a single program counter in a stack trace.
 type Frame uintptr
 
 // pc returns the program counter for this frame.
 // It subtracts 1 because runtime.Callers and runtime.FuncForPC
-// use different conventions for the program counter.
+// use different conventions for the program counter. This adjustment
+// makes runtime.FuncForPC return the correct file/line for the call site.
 func (f Frame) pc() uintptr { return uintptr(f) - 1 }
 
 // file returns the full path to the file for this Frame's pc.
@@ -54,7 +55,7 @@ func (f Frame) line() int {
 	return line
 }
 
-// name returns the name of this function.
+// name returns the full name of this function, including package path.
 func (f Frame) name() string {
 	fn := runtime.FuncForPC(f.pc())
 	if fn == nil {
@@ -64,14 +65,14 @@ func (f Frame) name() string {
 }
 
 // Format implements the fmt.Formatter interface for formatting a Frame.
-// This allows custom formatting verbs like %+v.
+// This allows custom formatting verbs like %+v when printing.
 //
 // Verbs:
 //
 //	%s  - prints the file name (e.g., "stacktrace.go")
 //	%+s - prints the full function name and file path (e.g., "main.go\n\t/path/to/main.go")
 //	%d  - prints the line number
-//	%n  - prints the function name (e.g., "main")
+//	%n  - prints the simple function name (e.g., "MyFunction")
 //	%v  - prints file:line (e.g., "stacktrace.go:100")
 //	%+v - prints function name, file, and line (e.g., "main.go\n\t/path/to/main.go:100")
 func (f Frame) Format(s fmt.State, verb rune) {
@@ -112,7 +113,7 @@ func (f Frame) Format(s fmt.State, verb rune) {
 			return
 		}
 	case 'n':
-		// Print simple function name.
+		// Print simple function name (without package path).
 		_, err = io.WriteString(s, funcname(f.name()))
 		if err != nil {
 			log.Printf("Error writing function name: %v", err) // Log the error
@@ -141,14 +142,14 @@ func (f Frame) MarshalText() ([]byte, error) {
 	return []byte(fmt.Sprintf("%s %s:%d", name, f.file(), f.line())), nil
 }
 
-// StackTrace is a stack of Frames from innermost (most recent) to outermost.
+// StackTrace is a stack of Frames from innermost (most recent call) to outermost.
 type StackTrace []Frame
 
 // Format implements the fmt.Formatter interface for formatting a StackTrace.
 //
 // Verbs:
 //
-//	%v  - prints a collapsed slice of frames
+//	%v  - prints a collapsed, single-line slice of frames
 //	%+v - prints a full, multi-line stack trace
 func (st StackTrace) Format(s fmt.State, verb rune) {
 	switch verb {
@@ -173,7 +174,7 @@ func (st StackTrace) Format(s fmt.State, verb rune) {
 	}
 }
 
-// formatSlice is a helper to format the stack trace as a slice of Frames.
+// formatSlice is a helper to format the stack trace as a single-line slice of Frames.
 func (st StackTrace) formatSlice(s fmt.State, verb rune) {
 	io.WriteString(s, "[")
 	for i, f := range st {
@@ -186,10 +187,12 @@ func (st StackTrace) formatSlice(s fmt.State, verb rune) {
 }
 
 // stack represents a raw stack of program counters.
+// This is the internal representation before it's converted to a StackTrace.
 type stack []uintptr
 
 // Format implements the fmt.Formatter interface for a raw stack.
-// It's primarily used to print the full trace when formatting a stackError.
+// It's primarily used to print the full trace when formatting a stackError
+// with the %+v verb.
 func (s *stack) Format(st fmt.State, verb rune) {
 	switch verb {
 	case 'v':
@@ -227,7 +230,10 @@ func callers() *stack {
 	pcs := *pcsPtr
 
 	// Capture the stack trace.
-	// Skip 3 frames: runtime.Callers, callers(), WithStack()
+	// Skip 3 frames:
+	// 0: runtime.Callers
+	// 1: logfile.callers (this function)
+	// 2: logfile.WithStack (the function that called this)
 	n := runtime.Callers(3, pcs)
 
 	// Create a new stack of the exact size needed.
@@ -250,6 +256,7 @@ func funcname(name string) string {
 }
 
 // stackError wraps an error with a stack trace.
+// It implements the error interface and the errors.Wrapper interface.
 type stackError struct {
 	error            // The original error.
 	*stack           // The stack trace captured when the error was wrapped.
@@ -257,10 +264,11 @@ type stackError struct {
 }
 
 // Unwrap returns the underlying error, implementing the errors.Wrapper interface.
-// This allows errors.Is and errors.As to work.
+// This allows errors.Is and errors.As to work correctly.
 func (w *stackError) Unwrap() error { return w.error }
 
 // Format implements the fmt.Formatter interface for stackError.
+// This allows custom formatting, especially for %+v.
 func (w *stackError) Format(s fmt.State, verb rune) {
 	switch verb {
 	case 'v':
@@ -268,7 +276,7 @@ func (w *stackError) Format(s fmt.State, verb rune) {
 			// Verbose: print the underlying error's verbose format,
 			// then print our own stack trace.
 			fmt.Fprintf(s, "%+v", w.Unwrap())
-			w.stack.Format(s, verb)
+			w.stack.Format(s, verb) // This will print the full stack
 			return
 		}
 		fallthrough
@@ -283,7 +291,7 @@ func (w *stackError) Format(s fmt.State, verb rune) {
 
 // WithStack annotates err with a stack trace at the point WithStack was called.
 // If err is nil, it returns nil.
-// If err already has a stack trace, it returns err unmodified.
+// If err already has a stack trace (as determined by HasStack), it returns err unmodified.
 func WithStack(err error) error {
 	if err == nil {
 		return nil
@@ -302,7 +310,7 @@ func WithStack(err error) error {
 }
 
 // GetStack finds the first error in the chain that has a stack trace
-// and returns the StackTrace if found.
+// (i.e., is a *stackError) and returns the StackTrace if found.
 func GetStack(err error) (StackTrace, bool) {
 	var target *stackError
 	// Use errors.As to search the error chain for a stackError.
@@ -313,7 +321,7 @@ func GetStack(err error) (StackTrace, bool) {
 	return target.StackTrace(), true
 }
 
-// HasStack returns true if any error in err's tree has a stacktrace.
+// HasStack returns true if any error in err's chain has a stacktrace.
 func HasStack(err error) bool {
 	var target *stackError
 	// errors.As checks if err or any of its wrapped errors are of type *stackError.
