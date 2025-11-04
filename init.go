@@ -1,4 +1,4 @@
-// logfile/init.go - Fixed logger initialization with new configuration structure
+// logfile/init.go - Logger initialization, worker pool, and shutdown.
 package logfile
 
 import (
@@ -17,9 +17,11 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// devMode is a constant string for development mode.
 const devMode = "dev"
 
-// NextMidnight calculates the duration until the next midnight.
+// NextMidnight calculates the duration until the next midnight (00:00).
+// This is used to schedule daily log rotation.
 func NextMidnight() time.Duration {
 	now := time.Now()
 	next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
@@ -28,8 +30,14 @@ func NextMidnight() time.Duration {
 	return duration
 }
 
-// Enhanced CreateLogger with dynamic worker scaling
+// CreateLogger initializes the entire logging system.
+// It sets up the configuration, creates the log channel, and starts the
+// worker goroutines and the auto-scaler.
 func CreateLogger() {
+	// Lock to protect global state during initialization.
+	loggerMutex.Lock()
+
+	// Load default config if none is loaded.
 	currentConfig := getConfigValue()
 	if currentConfig == nil {
 		defaultConfig := DefaultLogConfiguration()
@@ -37,10 +45,19 @@ func CreateLogger() {
 		currentConfig = &defaultConfig
 	}
 
-	// Create channel
-	logChannel = make(chan LogPayload, currentConfig.General.LogChannel)
+	// Prevent re-initialization if already active.
+	if logChannel != nil {
+		loggerMutex.Unlock()
+		log.Println("WARNING: CreateLogger called, but logger is already active.")
+		return
+	}
 
-	// Start with base number of workers
+	// Create the buffered channel for asynchronous logs.
+	logChannel = make(chan LogPayload, currentConfig.General.LogChannel)
+	// Create a channel to signal the scaler goroutine to stop.
+	scalerDone = make(chan struct{})
+
+	// Get worker pool configuration.
 	baseWorkers := 8
 	maxWorkers := 32
 
@@ -53,45 +70,82 @@ func CreateLogger() {
 		}
 	}
 
-	// Start base workers
+	// Unlock before starting goroutines to avoid holding lock.
+	loggerMutex.Unlock()
+
+	// Start the base number of workers.
 	for i := 0; i < baseWorkers; i++ {
 		logWorkers.Add(1)
 		go logWorker()
 	}
 
-	// OPTIMIZED: More aggressive worker scaling
+	// Start the dynamic worker auto-scaler goroutine.
+	logWorkers.Add(1)
 	go func() {
-		ticker := time.NewTicker(3 * time.Second) // Reduced from 5s
+		defer logWorkers.Done()
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
 		currentWorkers := baseWorkers
 
-		for range ticker.C {
-			usage := float64(len(logChannel)) / float64(cap(logChannel))
+		for {
+			// Safely read the scalerDone channel.
+			loggerMutex.RLock()
+			done := scalerDone
+			loggerMutex.RUnlock()
 
-			// Scale up more aggressively
-			if usage > 0.4 && currentWorkers < maxWorkers {
-				newWorkers := min(maxWorkers-currentWorkers, 4) // Add 4 at a time
-				for i := 0; i < newWorkers; i++ {
-					logWorkers.Add(1)
-					go logWorker()
-					currentWorkers++
-				}
+			// Check if shutdown has been initiated.
+			if done == nil {
+				return // scalerDone was set to nil by Shutdown.
 			}
 
-			// Scale down when idle
-			if usage < 0.1 && currentWorkers > baseWorkers {
-				// Workers will naturally exit when channel is empty
-				currentWorkers = max(baseWorkers, currentWorkers-2)
+			select {
+			case <-ticker.C:
+				// Check channel usage.
+				loggerMutex.RLock()
+				ch := logChannel
+				if ch == nil {
+					// logChannel was set to nil by Shutdown.
+					loggerMutex.RUnlock()
+					return
+				}
+				// Calculate buffer usage percentage.
+				usage := float64(len(ch)) / float64(cap(ch))
+				loggerMutex.RUnlock()
+
+				// Scale up: If buffer is > 40% full, add more workers.
+				if usage > 0.4 && currentWorkers < maxWorkers {
+					// Add up to 4 new workers, respecting maxWorkers limit.
+					newWorkers := min(maxWorkers-currentWorkers, 4)
+					for i := 0; i < newWorkers; i++ {
+						logWorkers.Add(1)
+						go logWorker()
+						currentWorkers++
+					}
+				}
+
+				// Scale down: If buffer is < 10% full, reduce workers (not implemented).
+				// This implementation only scales up.
+				if usage < 0.1 && currentWorkers > baseWorkers {
+					// This line is present but won't reduce goroutines,
+					// it just resets the internal counter.
+					// A real scale-down would require a worker pool implementation.
+					currentWorkers = max(baseWorkers, currentWorkers-2)
+				}
+
+			case <-done:
+				// Shutdown signal received.
+				return
 			}
 		}
 	}()
 
-	// Rest of your existing CreateLogger code...
+	// Initialize all logger instances (e.g., MessageLogger, ErrorLogger).
 	if err := SetLogger(); err != nil {
 		Fatal(nil, err, "SYSTEM: logger cannot be set")
 	}
 
+	// Log that the system is ready (synchronously).
 	Info(nil, false, "logger created",
 		slog.Group("data",
 			slog.Any("config", currentConfig),
@@ -100,12 +154,14 @@ func CreateLogger() {
 		),
 	)
 
-	// Log rotation goroutine (unchanged)
+	// Start the daily log rotation goroutine.
 	if !Testing {
 		go func() {
 			for {
+				// Wait until the next midnight.
 				nextRotation := time.After(NextMidnight())
 				<-nextRotation
+				// Re-run SetLogger to create new files.
 				if err := SetLogger(); err != nil {
 					log.Printf("SYSTEM: logger rotation failed: %v", err)
 				} else {
@@ -116,11 +172,28 @@ func CreateLogger() {
 	}
 }
 
-// OPTIMIZED: logWorker with object pooling
+// logWorker is the function executed by each worker goroutine.
+// It blocks on the logChannel, processes messages, and returns them to the pool.
 func logWorker() {
 	defer logWorkers.Done()
 
-	for payload := range logChannel {
+	for {
+		// Safely read the logChannel.
+		loggerMutex.RLock()
+		ch := logChannel
+		loggerMutex.RUnlock()
+
+		if ch == nil {
+			return // Channel is nil, system is shutting down.
+		}
+
+		// Read the next log payload from the channel.
+		payload, ok := <-ch
+		if !ok {
+			return // Channel is closed, system is shutting down.
+		}
+
+		// Process the log entry.
 		logToSpecificLogger(
 			payload.Logger,
 			payload.Level,
@@ -132,27 +205,48 @@ func logWorker() {
 			payload.OtherAttrs,
 		)
 
-		// Return payload to pool if pooling is enabled
+		// Return the LogPayload object to the pool for reuse.
 		if Config != nil && Config.General.EnableObjectPooling {
 			putLogPayload(&payload)
 		}
 	}
 }
 
-// Shutdown gracefully shuts down the logging system, ensuring all async logs are written.
-// This should be called before the application exits.
+// Shutdown gracefully shuts down the logging system.
+// It signals all workers to stop, waits for them to finish, and flushes buffers.
 func Shutdown() {
-	close(logChannel) // Close the channel to signal workers to stop
-	logWorkers.Wait() // Wait for all worker goroutines to finish processing
-	FlushAll()        // Final flush of all underlying writers
+	loggerMutex.Lock()
+	if logChannel == nil {
+		loggerMutex.Unlock()
+		return // Already shut down or never initialized.
+	}
+
+	// Signal the auto-scaler to stop.
+	if scalerDone != nil {
+		close(scalerDone)
+		scalerDone = nil // Set to nil to signal scaler has been stopped.
+	}
+
+	// Close the log channel to signal workers to stop.
+	close(logChannel)
+	logChannel = nil // Set to nil to prevent new logs.
+
+	loggerMutex.Unlock()
+
+	// Wait for all worker goroutines (and the scaler) to exit.
+	logWorkers.Wait()
+
+	// Flush any remaining buffers in the underlying writers (e.g., lumberjack).
+	FlushAll()
 }
 
 // SetLogger initializes or reinitializes all loggers based on the current configuration.
+// This is used at startup and for log rotation.
 func SetLogger() error {
-	loggerMutex.Lock()
+	loggerMutex.Lock() // Full lock to replace all logger instances.
 	defer loggerMutex.Unlock()
 
-	// Close existing writers before creating new ones
+	// Close existing writers to flush buffers before replacing them.
 	if AppLogger != nil {
 		if AppLogger.MessageLogger != nil {
 			AppLogger.MessageLogger.Flush()
@@ -175,50 +269,51 @@ func SetLogger() error {
 		if AppLogger.DebugLogger != nil {
 			AppLogger.DebugLogger.Flush()
 		}
-		if AppLogger.IndexLogger != nil { // New: Flush index logger
+		if AppLogger.IndexLogger != nil {
 			AppLogger.IndexLogger.Flush()
 		}
 	}
 
 	newAppLogger := &Loggers{}
-	allMultLoggers := make(map[string]*MultLogger) // Map to store all created MultLoggers by type
+	allMultLoggers := make(map[string]*MultLogger)
 	currentConfig := getConfigValue()
 
 	// --- First Pass: Create all primary MultLoggers ---
+	// This pass creates all the logger instances and their primary writers.
 	for logType, fileConfig := range currentConfig.Files {
 
-		// Determine the primary writer based on UseFileWriter and ConsoleStd
 		var primaryWriter io.Writer
 		if !fileConfig.UseFileWriter {
-			// If both are false, write to Discard
+			// If file writing is disabled, discard all output.
 			primaryWriter = io.Discard
 		} else if fileConfig.UseFileWriter {
+			// Configure lumberjack for file-based logging and rotation.
 			logFolder := filepath.Dir(fileConfig.Path)
 			baseName := filepath.Base(fileConfig.Path)
 			ext := filepath.Ext(baseName)
 			nameWithoutExt := strings.TrimSuffix(baseName, ext)
 
-			// Create directory if it doesn't exist
+			// Ensure log directory exists.
 			if err := os.MkdirAll(logFolder, 0700); err != nil {
 				return fmt.Errorf("failed to create log directory %s: %w", logFolder, err)
 			}
 
-			// Construct the filename with the current date (e.g., "logs/Debug/Debug.2024-06-19.log")
-			// TimeFormat is assumed to be defined in types.go (e.g., time.DateOnly "2006-01-02")
+			// Create a date-stamped filename for lumberjack.
 			datedFilename := filepath.Join(logFolder, fmt.Sprintf("%s.%s%s", time.Now().Format(TimeFormat), nameWithoutExt, ext))
 
 			primaryWriter = &lumberjack.Logger{
-				Filename:   datedFilename,
+				Filename:   datedFilename, // The file to write to.
 				MaxSize:    fileConfig.MaxSizeMB,
 				MaxBackups: fileConfig.MaxBackups,
 				MaxAge:     fileConfig.MaxAgeDays,
 				Compress:   fileConfig.Compress,
 			}
-		} else { // Only ConsoleStd is true (or UseFileWriter is false but ConsoleStd is true)
+		} else {
+			// Default to Stderr if not using file and not discarded.
 			primaryWriter = os.Stderr
 		}
 
-		// Use MinLevel from FileConfig, fall back to LevelsByType if not specified
+		// Determine the log level for this logger.
 		levelStr := fileConfig.MinLevel
 		if levelStr == "" {
 			levelStr = currentConfig.General.LevelsByType[logType]
@@ -228,19 +323,21 @@ func SetLogger() error {
 			return fmt.Errorf("invalid log level for type %s: %w", logType, err)
 		}
 
+		// Create the MultLogger instance.
 		ml, err := createMultLogger(
 			logType,
-			fileConfig,    // Pass the full fileConfig
-			primaryWriter, // Pass the determined primaryWriter
+			fileConfig,
+			primaryWriter,
 			level,
-			currentConfig, // Pass the full Config to access General.AddSource
+			currentConfig,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create logger for type %s: %w", logType, err)
 		}
+		// Store it in the map for the second pass.
 		allMultLoggers[logType] = ml
 
-		// Assign to newAppLogger fields
+		// Assign it to the correct field in the AppLogger struct.
 		switch logType {
 		case "message":
 			newAppLogger.MessageLogger = ml
@@ -256,32 +353,35 @@ func SetLogger() error {
 			newAppLogger.NMMLogger = ml
 		case "debug":
 			newAppLogger.DebugLogger = ml
-		case "index": // New: Assign index logger
+		case "index":
 			newAppLogger.IndexLogger = ml
 		}
 	}
 
-	// --- Second Pass: Wire up Additional Outputs and pre-create loggers ---
+	// --- Second Pass: Wire up Additional Outputs ---
+	// This pass connects loggers to *other* loggers (e.g., 'error' logs
+	// also go to 'message'). This must be done after all loggers exist.
 	for logType, ml := range allMultLoggers {
 		ml.additionalSlogLoggers = make(map[OutputTarget]*slog.Logger)
 		ml.additionalStdLoggers = make(map[OutputTarget]*log.Logger)
 
 		// Slog Outputs
 		for _, target := range ml.config.AdditionalOutputs.SlogOutputs {
+			// Find the target logger instance from the map.
 			targetMl, ok := allMultLoggers[target.Type]
 			if !ok {
 				log.Printf("Warning: Additional slog output target '%s' for log type '%s' not found.", target.Type, logType)
 				continue
 			}
-			// Pre-create slog.Logger for the target's primary writer
-			targetLevel := targetMl.level.ToSlogLevel() // Use target's own level
+			targetLevel := targetMl.level.ToSlogLevel()
 			var handler slog.Handler
 			if targetMl.config.Structured {
+				// Create a JSON handler writing to the target's writer.
 				handler = slog.NewJSONHandler(targetMl.writer, &slog.HandlerOptions{
 					AddSource: currentConfig.General.AddSource,
 					Level:     targetLevel,
 					ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-						// Add a timestamp to the slog output for additional writers if not present
+						// Custom time formatting.
 						if a.Key == slog.TimeKey && a.Value.Kind() == slog.KindAny {
 							if t, ok := a.Value.Any().(time.Time); ok {
 								return slog.String(slog.TimeKey, t.Format(DefaultTimeFormat))
@@ -291,37 +391,41 @@ func SetLogger() error {
 					},
 				})
 			} else {
+				// Create a Text handler.
 				handler = slog.NewTextHandler(targetMl.writer, &slog.HandlerOptions{
 					AddSource: currentConfig.General.AddSource,
 					Level:     targetLevel,
 				})
 			}
+			// Store the new slog.Logger instance.
 			ml.additionalSlogLoggers[target] = slog.New(handler)
 		}
 
 		// Std Outputs
 		for _, target := range ml.config.AdditionalOutputs.StdOutputs {
+			// Find the target logger instance.
 			targetMl, ok := allMultLoggers[target.Type]
 			if !ok {
 				log.Printf("Warning: Additional std output target '%s' for log type '%s' not found.", target.Type, logType)
 				continue
 			}
-			// Pre-create standard log.Logger for the target's primary writer
-			ml.additionalStdLoggers[target] = log.New(targetMl.writer, "", 0) // Standard logger usually doesn't need explicit formatting options here
+			// Create a new log.Logger writing to the target's writer.
+			ml.additionalStdLoggers[target] = log.New(targetMl.writer, "", 0)
 		}
 	}
 
-	AppLogger = newAppLogger // Assign the fully configured loggers
+	// Atomically swap the old AppLogger with the new one.
+	AppLogger = newAppLogger
 	return nil
 }
 
-// createMultLogger helper to create a MultLogger instance based on FileConfig.
+// createMultLogger is a helper to create a MultLogger instance based on FileConfig.
 func createMultLogger(
 	logType string,
 	fileConfig FileConfig,
-	primaryWriter io.Writer, // Now explicitly passed
+	primaryWriter io.Writer,
 	level LogLevel,
-	config *LogConfiguration, // Pass the entire config
+	config *LogConfiguration,
 ) (*MultLogger, error) {
 	ml := &MultLogger{
 		name:   logType,
@@ -332,13 +436,12 @@ func createMultLogger(
 
 	// Slog Logger Setup
 	if fileConfig.SlogWriter {
-		// --- Step 1: Create the individual handlers without correction ---
-
-		// Create the handler for the JSON file output
+		// Handler for writing to the primary file writer (lumberjack).
 		var fileHandler slog.Handler = slog.NewJSONHandler(ml.writer, &slog.HandlerOptions{
 			AddSource: config.General.AddSource,
 			Level:     level.ToSlogLevel(),
 			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				// Custom time formatting for file logs.
 				if a.Key == slog.TimeKey && a.Value.Kind() == slog.KindAny {
 					if t, ok := a.Value.Any().(time.Time); ok {
 						return slog.String(slog.TimeKey, t.Format(DefaultTimeFormat))
@@ -348,10 +451,11 @@ func createMultLogger(
 			},
 		})
 
-		// Create the handler for the console (pretty-print or JSON)
+		// Handler for writing to the console (stderr).
 		var consoleHandler slog.Handler
 		if fileConfig.ConsoleStd {
 			if config.General.PrettyPrint {
+				// Use 'devslog' for pretty-printed, human-readable console output.
 				opts := &devslog.Options{
 					HandlerOptions: &slog.HandlerOptions{
 						AddSource: config.General.AddSource,
@@ -364,6 +468,7 @@ func createMultLogger(
 				}
 				consoleHandler = devslog.NewHandler(os.Stderr, opts)
 			} else {
+				// Use standard JSON handler for console.
 				consoleHandler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 					AddSource: config.General.AddSource,
 					Level:     level.ToSlogLevel(),
@@ -371,40 +476,33 @@ func createMultLogger(
 			}
 		}
 
-		// --- Step 2: Combine handlers if needed ---
-
+		// Combine file and console handlers if both are active.
 		var baseHandler slog.Handler
 		if consoleHandler != nil {
-			// If we have both file and console, combine them with multiHandler
 			baseHandler = &multiHandler{
 				fileHandler:    fileHandler,
 				consoleHandler: consoleHandler,
 			}
 		} else {
-			// Otherwise, the base handler is just the file handler
 			baseHandler = fileHandler
 		}
 
-		// This is the crucial change. We wrap the baseHandler (which could be
-		// the multiHandler or just the fileHandler) to correct the source
-		// for ALL destinations.
+		// Wrap with the SourceCorrectingHandler if AddSource is enabled.
 		var finalHandler slog.Handler
 		if config.General.AddSource {
-			// If AddSource is true, use the expensive handler for correctness.
 			finalHandler = &SourceCorrectingHandler{Handler: baseHandler}
 		} else {
-			// If AddSource is false, use the fast, unwrapped handler for performance.
 			finalHandler = baseHandler
 		}
 
 		ml.StructuredLogger = slog.New(finalHandler)
 
 	} else {
-		// If SlogWriter is false, ensure structuredLogger is completely disabled
+		// If SlogWriter is disabled, create a logger that discards all writes.
 		ml.StructuredLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	// Standard Logger Setup (This part remains the same)
+	// Standard Logger (log.Logger) Setup
 	if fileConfig.StdWriter {
 		var stdWriters []io.Writer
 		if fileConfig.UseFileWriter {
@@ -416,11 +514,14 @@ func createMultLogger(
 		}
 
 		if len(stdWriters) == 0 {
+			// No output, discard.
 			ml.StdLogger = log.New(io.Discard, "", 0)
 		} else {
+			// Create a logger that writes to all specified writers.
 			ml.StdLogger = log.New(io.MultiWriter(stdWriters...), "", 0)
 		}
 	} else {
+		// If StdWriter is disabled, discard all writes.
 		ml.StdLogger = log.New(io.Discard, "", 0)
 	}
 
@@ -433,33 +534,31 @@ type multiHandler struct {
 	consoleHandler slog.Handler
 }
 
-// Enabled reports whether the handler handles records at the given level.
+// Enabled checks if *either* handler is enabled for the given level.
 func (h *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	// A message is enabled if either the file handler or the console handler enables it.
-	// This ensures that even if one is disabled by level, the other might still log.
 	return h.fileHandler.Enabled(ctx, level) || (h.consoleHandler != nil && h.consoleHandler.Enabled(ctx, level))
 }
 
-// Handle handles the Record.
+// Handle sends the log record to both the file and console handlers.
 func (h *multiHandler) Handle(ctx context.Context, record slog.Record) error {
 	var err1, err2 error
 
-	// Always handle by file handler
+	// Handle file log.
 	err1 = h.fileHandler.Handle(ctx, record)
 
-	// Handle console logging if enabled by its own Enabled method
+	// Handle console log, if enabled.
 	if h.consoleHandler != nil && h.consoleHandler.Enabled(ctx, record.Level) {
 		err2 = h.consoleHandler.Handle(ctx, record)
 	}
 
-	// Return the first error encountered, if any
+	// Return the first error encountered.
 	if err1 != nil {
 		return err1
 	}
 	return err2
 }
 
-// WithAttrs returns a new Handler whose attributes consist of h's attributes followed by attrs.
+// WithAttrs returns a new multiHandler with the attributes added to both sub-handlers.
 func (h *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	newFileHandler := h.fileHandler.WithAttrs(attrs)
 	var newConsoleHandler slog.Handler
@@ -472,7 +571,7 @@ func (h *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 }
 
-// WithGroup returns a new Handler whose group settings consist of h's group settings followed by group.
+// WithGroup returns a new multiHandler with the group added to both sub-handlers.
 func (h *multiHandler) WithGroup(name string) slog.Handler {
 	newFileHandler := h.fileHandler.WithGroup(name)
 	var newConsoleHandler slog.Handler
@@ -485,26 +584,24 @@ func (h *multiHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-// Place this in init.go or handler.go, replacing the old SourceCorrectingHandler
-
-// SourceCorrectingHandler is a slog.Handler that wraps another handler to correct
-// the source code location of the log record.
+// SourceCorrectingHandler is a slog.Handler that wraps another handler
+// to correct the source code location (file:line) of the log record.
+// It walks the call stack to find the first frame *outside* this logging package.
 type SourceCorrectingHandler struct {
 	slog.Handler
 }
 
-// Handle corrects the source location by filtering known logging packages.
+// Handle finds the correct call frame and updates the record's PC before
+// passing it to the underlying handler.
 func (h *SourceCorrectingHandler) Handle(ctx context.Context, r slog.Record) error {
 	var pc uintptr
 	var ok bool
 
-	// We start at frame 2, because:
-	// Frame 0 is runtime.Callers itself.
-	// Frame 1 is this Handle function.
-	for i := 2; i < 20; i++ {
+	// Search up the stack for the call site.
+	for i := 2; i < 20; i++ { // Start at 2 to skip runtime.Caller and this Handle.
 		pc, _, _, ok = runtime.Caller(i)
 		if !ok {
-			// If we can't find a caller, we'll just pass the record as-is.
+			// Stack walk failed.
 			return h.Handler.Handle(ctx, r)
 		}
 
@@ -514,16 +611,16 @@ func (h *SourceCorrectingHandler) Handle(ctx context.Context, r slog.Record) err
 		}
 		name := fn.Name()
 
+		// Skip frames that are part of slog or this package.
 		if strings.HasPrefix(name, "log/slog.") || strings.Contains(name, "/internal/logger.") {
 			continue
 		}
 
-		// The first function that is not part of the logging system is the true source.
-		// We update the record's Program Counter (PC) and stop searching.
+		// Found the correct frame. Update the record's PC and pass it on.
 		r.PC = pc
 		return h.Handler.Handle(ctx, r)
 	}
 
-	// Fallback in case we can't find the caller.
+	// Fallback to default handling if no suitable frame was found.
 	return h.Handler.Handle(ctx, r)
 }
