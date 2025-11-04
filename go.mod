@@ -1,6 +1,8 @@
 module github.com/mkadit/logfile
 
-go 1.24.9
+go 1.21.0
+
+toolchain go1.21.13
 
 require (
 	github.com/golang-cz/devslog v0.0.15
