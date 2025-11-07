@@ -268,6 +268,36 @@ func LoadConfigurationFromFile(filePath string) error {
 	return nil
 }
 
+// LoadConfigurationFromBytes loads a logging configuration from a byte slice.
+// It atomically updates the global 'Config' variable, making the change
+// thread-safe and visible to all logger functions.
+func LoadConfigurationFromBytes(data []byte) error {
+	var loadedConfig LogConfiguration
+
+	if err := json.Unmarshal(data, &loadedConfig); err != nil {
+		return fmt.Errorf("failed to unmarshal configuration JSON from bytes: %w", err)
+	}
+
+	// Store the new config atomically.
+	// Functions like getConfigValue() will now see this new version.
+	Config.Store(&loadedConfig)
+	return nil
+}
+
+// LoadConfigurationFromStruct loads a logging configuration from an existing struct.
+// It atomically updates the global 'Config' variable, making the change
+// thread-safe and visible to all logger functions.
+func LoadConfigurationFromStruct(config *LogConfiguration) error {
+	if config == nil {
+		return fmt.Errorf("cannot load a nil LogConfiguration struct")
+	}
+
+	// Store the provided config struct atomically.
+	// Functions like getConfigValue() will now see this new version.
+	Config.Store(config)
+	return nil
+}
+
 // GetLogLevel retrieves the current minimum log level for a specific logger type.
 // It safely accesses the AppLogger map to find the correct logger.
 func GetLogLevel(logType string) (LogLevel, error) {
