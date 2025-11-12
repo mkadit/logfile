@@ -236,6 +236,15 @@ func (ml *MessageLog) Clone() *MessageLog {
 	}
 }
 
+func (ml *MessageLog) WithFlowStep(step int, flow string) *MessageLog {
+	clone := ml.Clone()
+	if clone != nil {
+		clone.Step = step
+		clone.Flow = flow
+	}
+	return clone
+}
+
 func (ml *MessageLog) WithStep(step int) *MessageLog {
 	clone := ml.Clone()
 	if clone != nil {
