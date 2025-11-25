@@ -255,7 +255,7 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 
 	if err != nil {
 		// Include stack trace if available
-		slogAttrs = append(slogAttrs, slog.String("error", fmt.Sprintf("%+v", WithStack(err))))
+		slogAttrs = append(slogAttrs, slog.String("error", fmt.Sprintf("%+v", err)))
 	}
 
 	// Add MessageLog attributes if present
