@@ -4,6 +4,7 @@ package logfile
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -479,5 +480,208 @@ func isBasicType(val any) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// JSONFormatter converts log data to JSON strings that match slog.JSONHandler output.
+type JSONFormatter struct {
+	addSource  bool
+	timeFormat string
+}
+
+// NewJSONFormatter creates a JSONFormatter with the given configuration.
+func NewJSONFormatter(addSource bool, timeFormat string) *JSONFormatter {
+	return &JSONFormatter{
+		addSource:  addSource,
+		timeFormat: timeFormat,
+	}
+}
+
+// FormatRecord converts log data to JSON matching slog.JSONHandler output.
+func (f *JSONFormatter) FormatRecord(level LogLevel, eventType string, err error, msg, timeNow string, ml *MessageLog, otherAttrs []any) ([]byte, error) {
+	// Build the log record data structure
+	record := make(map[string]any, 32) // Pre-allocate capacity
+
+	// Add base fields
+	record["event_type"] = eventType
+	record["timestamp"] = timeNow
+
+	// Add level based on the log type (for consistency with slog)
+	if level != LevelInfo {
+		record["level"] = level.String()
+	}
+
+	if err != nil {
+		record["error"] = fmt.Sprintf("%+v", err)
+	}
+
+	// Add MessageLog attributes if present
+	if ml != nil {
+		// Use read-only snapshot method
+		currentStepDuration := ml.GetCurrentStepDurationSnapshot()
+		mlAttrs := ml.ToSlogAttrs()
+
+		// Add step timing information
+		currentStep := ml.GetCurrentStep()
+		if currentStep > 1 {
+			record["duration_step_active"] = currentStepDuration.String()
+
+			// Get duration of the previously completed step
+			if prevDuration := ml.GetStepDuration(currentStep - 1); prevDuration > 0 {
+				record["duration_step_completed"] = prevDuration.String()
+			}
+		}
+
+		// Add performance flags
+		totalDuration := ml.GetDurationSinceStart()
+		if totalDuration > time.Second {
+			record["performance_flag_slow"] = true
+		}
+		if currentStep > 10 {
+			record["performance_flag_many_steps"] = true
+		}
+
+		// Add all MessageLog attributes
+		for _, attr := range mlAttrs {
+			switch attr.Value.Kind() {
+			case slog.KindString:
+				record[attr.Key] = attr.Value.String()
+			case slog.KindInt64:
+				record[attr.Key] = attr.Value.Int64()
+			case slog.KindUint64:
+				record[attr.Key] = attr.Value.Uint64()
+			case slog.KindFloat64:
+				record[attr.Key] = attr.Value.Float64()
+			case slog.KindBool:
+				record[attr.Key] = attr.Value.Bool()
+			case slog.KindTime:
+				record[attr.Key] = f.formatTime(attr.Value.Time())
+			case slog.KindAny:
+				record[attr.Key] = f.formatAny(attr.Value.Any())
+			}
+		}
+	}
+
+	// Process 'otherAttrs' (from Info, Error, etc.)
+	for _, a := range otherAttrs {
+		if sa, ok := a.(slog.Attr); ok {
+			// It's already an slog.Attr
+			var safeValue any
+			// Deep copy if it's not a basic type
+			if isBasicType(sa.Value.Any()) {
+				safeValue = sa.Value.Any()
+			} else {
+				safeValue = deepCopyAny(sa.Value.Any())
+			}
+
+			switch sa.Value.Kind() {
+			case slog.KindString:
+				record[sa.Key] = safeValue.(string)
+			case slog.KindInt64:
+				record[sa.Key] = sa.Value.Int64()
+			case slog.KindUint64:
+				record[sa.Key] = sa.Value.Uint64()
+			case slog.KindFloat64:
+				record[sa.Key] = sa.Value.Float64()
+			case slog.KindBool:
+				record[sa.Key] = sa.Value.Bool()
+			case slog.KindTime:
+				record[sa.Key] = f.formatTime(sa.Value.Time())
+			case slog.KindAny:
+				record[sa.Key] = f.formatAny(safeValue)
+			}
+		} else {
+			// It's a plain 'any' type
+			var safeCopy any
+			if isBasicType(a) {
+				safeCopy = a
+			} else {
+				safeCopy = deepCopyAny(a)
+			}
+
+			if safeCopy != nil {
+				record["arg"] = f.formatAny(safeCopy)
+			}
+		}
+	}
+
+	// Add source if enabled
+	if f.addSource {
+		sourceAttr := getCallerSource()
+		if sourceAttr.Value.Kind() == slog.KindString {
+			record[sourceAttr.Key] = sourceAttr.Value.String()
+		}
+	}
+
+	// Add the main message
+	record["msg"] = msg
+
+	// Marshal to JSON
+	return json.Marshal(record)
+}
+
+// formatTime formats time values according to the formatter's time format.
+func (f *JSONFormatter) formatTime(t time.Time) string {
+	return t.Format(f.timeFormat)
+}
+
+// formatAny handles complex types for JSON marshaling.
+func (f *JSONFormatter) formatAny(value any) any {
+	if value == nil {
+		return nil
+	}
+
+	switch v := value.(type) {
+	case map[string]any:
+		// Recursively format nested maps
+		result := make(map[string]any, len(v))
+		for k, val := range v {
+			result[k] = f.formatAny(val)
+		}
+		return result
+	case map[int]any:
+		// Convert int keys to strings for JSON compatibility
+		result := make(map[string]any, len(v))
+		for k, val := range v {
+			result[fmt.Sprintf("key_%d", k)] = f.formatAny(val)
+		}
+		return result
+	case map[int]string:
+		result := make(map[string]any, len(v))
+		for k, val := range v {
+			result[fmt.Sprintf("key_%d", k)] = val
+		}
+		return result
+	case map[int]time.Duration:
+		result := make(map[string]any, len(v))
+		for k, val := range v {
+			result[fmt.Sprintf("step_%d", k)] = val.String()
+		}
+		return result
+	case []any:
+		// Recursively format slices
+		result := make([]any, len(v))
+		for i, val := range v {
+			result[i] = f.formatAny(val)
+		}
+		return result
+	case []string:
+		// Convert string slices directly
+		result := make([]any, len(v))
+		for i, val := range v {
+			result[i] = val
+		}
+		return result
+	case []int:
+		result := make([]any, len(v))
+		for i, val := range v {
+			result[i] = val
+		}
+		return result
+	case time.Duration:
+		return v.String()
+	default:
+		// For basic types and custom structs, return as-is
+		return v
 	}
 }

@@ -477,3 +477,429 @@ func SlowOperation(ml *MessageLog, async bool, expectedDuration, actualDuration 
 
 	Warn(ml, async, message, slowAttrs...)
 }
+
+// InfoCapture logs an informational message and returns the JSON representation.
+// It writes to EventLogger and (if enabled) IndexLogger, just like Info().
+func InfoCapture(ml *MessageLog, async bool, message string, attr ...any) (string, error) {
+	if Testing || !isLoggerActive() {
+		return "", fmt.Errorf("logging system not active or in test mode")
+	}
+
+	loggerMutex.RLock()
+	defer loggerMutex.RUnlock()
+
+	if AppLogger == nil {
+		return "", fmt.Errorf("no logger available")
+	}
+
+	// Get configuration for JSON formatting
+	currentConfig := getConfigValue()
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (clones/copies if async)
+	payload := getPayload(LevelInfo, "info", nil, message, ml, attr, async)
+
+	// Generate JSON from the payload
+	jsonBytes, err := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", err)
+	}
+
+	// Log to EventLogger
+	if AppLogger.EventLogger != nil {
+		payload.Logger = AppLogger.EventLogger
+		dispatchLog(payload, async)
+	}
+
+	// Log to centralized IndexLogger
+	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
+		payload.Logger = AppLogger.IndexLogger
+		payload.EventType = "index" // Mark as 'index' type for this logger
+		dispatchLog(payload, async)
+	}
+
+	return string(jsonBytes), nil
+}
+
+// ErrorCapture logs an error message and returns the JSON representation.
+// It writes to EventLogger, ErrorLogger, and (if enabled) IndexLogger, just like Error().
+func ErrorCapture(ml *MessageLog, async bool, err error, message string, attr ...any) (string, error) {
+	if Testing || !isLoggerActive() {
+		return "", fmt.Errorf("logging system not active or in test mode")
+	}
+
+	loggerMutex.RLock()
+	defer loggerMutex.RUnlock()
+
+	if AppLogger == nil {
+		return "", fmt.Errorf("no logger available")
+	}
+
+	// Get configuration for JSON formatting
+	currentConfig := getConfigValue()
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (clones/copies if async)
+	payload := getPayload(LevelError, "error", err, message, ml, attr, async)
+
+	// Generate JSON from the payload
+	jsonBytes, jsonErr := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if jsonErr != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", jsonErr)
+	}
+
+	// Log to EventLogger
+	if AppLogger.EventLogger != nil {
+		payload.Logger = AppLogger.EventLogger
+		dispatchLog(payload, async)
+	}
+
+	// Log to ErrorLogger
+	if AppLogger.ErrorLogger != nil {
+		payload.Logger = AppLogger.ErrorLogger
+		dispatchLog(payload, async)
+	}
+
+	// Log to centralized IndexLogger
+	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
+		payload.Logger = AppLogger.IndexLogger
+		dispatchLog(payload, async)
+	}
+
+	return string(jsonBytes), nil
+}
+
+// WarnCapture logs a warning message and returns the JSON representation.
+// It writes to EventLogger and (if enabled) IndexLogger, just like Warn().
+func WarnCapture(ml *MessageLog, async bool, message string, attr ...any) (string, error) {
+	if Testing || !isLoggerActive() {
+		return "", fmt.Errorf("logging system not active or in test mode")
+	}
+
+	loggerMutex.RLock()
+	defer loggerMutex.RUnlock()
+
+	if AppLogger == nil {
+		return "", fmt.Errorf("no logger available")
+	}
+
+	// Get configuration for JSON formatting
+	currentConfig := getConfigValue()
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (clones/copies if async)
+	payload := getPayload(LevelWarn, "warn", nil, message, ml, attr, async)
+
+	// Generate JSON from the payload
+	jsonBytes, err := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", err)
+	}
+
+	// Log to EventLogger
+	if AppLogger.EventLogger != nil {
+		payload.Logger = AppLogger.EventLogger
+		dispatchLog(payload, async)
+	}
+
+	// Log to centralized IndexLogger
+	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
+		payload.Logger = AppLogger.IndexLogger
+		payload.EventType = "index"
+		dispatchLog(payload, async)
+	}
+
+	return string(jsonBytes), nil
+}
+
+// DebugCapture logs detailed debugging information and returns the JSON representation.
+// It only logs if DevelopmentMode is true, just like Debug().
+func DebugCapture(ml *MessageLog, async bool, message string, attr ...any) (string, error) {
+	currentConfig := getConfigValue()
+
+	// Exit early if not in development mode
+	if Testing || !isLoggerActive() || currentConfig == nil || !currentConfig.General.DevelopmentMode {
+		return "", fmt.Errorf("debug logging disabled or in test mode")
+	}
+
+	loggerMutex.RLock()
+	defer loggerMutex.RUnlock()
+
+	if AppLogger == nil || AppLogger.DebugLogger == nil {
+		return "", fmt.Errorf("no debug logger available")
+	}
+
+	// Create JSON formatter
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (clones/copies if async)
+	payload := getPayload(LevelDebug, "debug", nil, message, ml, attr, async)
+
+	// Generate JSON from the payload
+	jsonBytes, err := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", err)
+	}
+
+	// Log to EventLogger
+	if AppLogger.EventLogger != nil {
+		payload.Logger = AppLogger.EventLogger
+		dispatchLog(payload, async)
+	}
+
+	// Log to DebugLogger
+	if AppLogger.DebugLogger != nil {
+		payload.Logger = AppLogger.DebugLogger
+		dispatchLog(payload, async)
+	}
+
+	// Log to centralized IndexLogger
+	if currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
+		payload.Logger = AppLogger.IndexLogger
+		payload.EventType = "index"
+		dispatchLog(payload, async)
+	}
+
+	return string(jsonBytes), nil
+}
+
+// CriticalCapture logs a critical error and returns the JSON representation.
+// It writes to CriticalLogger and (if enabled) IndexLogger, just like Critical().
+func CriticalCapture(ml *MessageLog, async bool, err error, message string, attr ...any) (string, error) {
+	if Testing || !isLoggerActive() {
+		return "", fmt.Errorf("logging system not active or in test mode")
+	}
+
+	loggerMutex.RLock()
+	defer loggerMutex.RUnlock()
+
+	if AppLogger == nil || AppLogger.CriticalLogger == nil {
+		return "", fmt.Errorf("no critical logger available")
+	}
+
+	// Get configuration for JSON formatting
+	currentConfig := getConfigValue()
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (clones/copies if async)
+	payload := getPayload(LevelCritical, "critical", err, message, ml, attr, async)
+
+	// Generate JSON from the payload
+	jsonBytes, jsonErr := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if jsonErr != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", jsonErr)
+	}
+
+	// Log to CriticalLogger
+	if AppLogger.CriticalLogger != nil {
+		payload.Logger = AppLogger.CriticalLogger
+		dispatchLog(payload, async)
+	}
+
+	// Log to centralized IndexLogger
+	if currentConfig != nil && currentConfig.General.EnableCentralizedLogging && AppLogger.IndexLogger != nil {
+		payload.Logger = AppLogger.IndexLogger
+		dispatchLog(payload, async)
+	}
+
+	return string(jsonBytes), nil
+}
+
+
+// CaptureInfo generates JSON representation of an informational message without logging.
+func CaptureInfo(ml *MessageLog, message string, attr ...any) (string, error) {
+	// Get configuration for JSON formatting
+	currentConfig := getConfigValue()
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (no need to clone for capture-only)
+	payload := getPayload(LevelInfo, "info", nil, message, ml, attr, false)
+
+	// Generate JSON from the payload
+	jsonBytes, err := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", err)
+	}
+
+	// Return payload to pool if enabled
+	if currentConfig != nil && currentConfig.General.EnableObjectPooling {
+		putLogPayload(&payload)
+	}
+
+	return string(jsonBytes), nil
+}
+
+// CaptureError generates JSON representation of an error message without logging.
+func CaptureError(ml *MessageLog, err error, message string, attr ...any) (string, error) {
+	// Get configuration for JSON formatting
+	currentConfig := getConfigValue()
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (no need to clone for capture-only)
+	payload := getPayload(LevelError, "error", err, message, ml, attr, false)
+
+	// Generate JSON from the payload
+	jsonBytes, jsonErr := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if jsonErr != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", jsonErr)
+	}
+
+	// Return payload to pool if enabled
+	if currentConfig != nil && currentConfig.General.EnableObjectPooling {
+		putLogPayload(&payload)
+	}
+
+	return string(jsonBytes), nil
+}
+
+// CaptureWarn generates JSON representation of a warning message without logging.
+func CaptureWarn(ml *MessageLog, message string, attr ...any) (string, error) {
+	// Get configuration for JSON formatting
+	currentConfig := getConfigValue()
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (no need to clone for capture-only)
+	payload := getPayload(LevelWarn, "warn", nil, message, ml, attr, false)
+
+	// Generate JSON from the payload
+	jsonBytes, err := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", err)
+	}
+
+	// Return payload to pool if enabled
+	if currentConfig != nil && currentConfig.General.EnableObjectPooling {
+		putLogPayload(&payload)
+	}
+
+	return string(jsonBytes), nil
+}
+
+// CaptureDebug generates JSON representation of a debug message without logging.
+// It only works if DevelopmentMode is true, just like Debug().
+func CaptureDebug(ml *MessageLog, message string, attr ...any) (string, error) {
+	currentConfig := getConfigValue()
+
+	// Exit early if not in development mode
+	if Testing || !currentConfig.General.DevelopmentMode {
+		return "", fmt.Errorf("debug logging disabled or in test mode")
+	}
+
+	// Create JSON formatter
+	jsonFormatter := NewJSONFormatter(
+		currentConfig != nil && currentConfig.General.AddSource,
+		DefaultTimeFormat,
+	)
+
+	// Create a payload (no need to clone for capture-only)
+	payload := getPayload(LevelDebug, "debug", nil, message, ml, attr, false)
+
+	// Generate JSON from the payload
+	jsonBytes, err := jsonFormatter.FormatRecord(
+		payload.Level,
+		payload.EventType,
+		payload.Err,
+		payload.Msg,
+		payload.TimeNow,
+		payload.Ml,
+		payload.OtherAttrs,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to format JSON: %w", err)
+	}
+
+	// Return payload to pool if enabled
+	if currentConfig != nil && currentConfig.General.EnableObjectPooling {
+		putLogPayload(&payload)
+	}
+
+	return string(jsonBytes), nil
+}
