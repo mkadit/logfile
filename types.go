@@ -241,48 +241,48 @@ type Loggers struct {
 
 // LogConfiguration is the top-level struct for the JSON config file.
 type LogConfiguration struct {
-	General GeneralConfig         `json:"general"`
-	Files   map[string]FileConfig `json:"files"`
+	General GeneralConfig         `json:"general" yaml:"general" xml:"general"`
+	Files   map[string]FileConfig `json:"files" yaml:"files" xml:"files"`
 }
 
 // GeneralConfig holds global logging settings.
 type GeneralConfig struct {
-	LevelsByType             map[string]string `json:"levels_by_type"`             // Fallback log levels
-	DevelopmentMode          bool              `json:"development_mode"`           // Enables debug logging
-	PrettyPrint              bool              `json:"pretty_print"`               // Use colorful console output
-	AddSource                bool              `json:"add_source"`                 // Log file:line (performance cost)
-	EnableCentralizedLogging bool              `json:"enable_centralized_logging"` // Forward logs to IndexLogger
-	LogChannel               int               `json:"log_channel"`                // Buffer size for async channel
-	WorkerPoolSize           int               `json:"worker_pool_size"`           // Initial worker goroutines
-	MaxWorkerPoolSize        int               `json:"max_worker_pool_size"`       // Max worker goroutines
-	EnableObjectPooling      bool              `json:"enable_object_pooling"`      // Use sync.Pool for LogPayloads
+	LevelsByType             map[string]string `json:"levels_by_type" yaml:"levels_by_type" xml:"levels_by_type"`                                     // Fallback log levels
+	DevelopmentMode          bool              `json:"development_mode" yaml:"development_mode" xml:"development_mode"`                               // Enables debug logging
+	PrettyPrint              bool              `json:"pretty_print" yaml:"pretty_print" xml:"pretty_print"`                                           // Use colorful console output
+	AddSource                bool              `json:"add_source" yaml:"add_source" xml:"add_source"`                                                 // Log file:line (performance cost)
+	EnableCentralizedLogging bool              `json:"enable_centralized_logging" yaml:"enable_centralized_logging" xml:"enable_centralized_logging"` // Forward logs to IndexLogger
+	LogChannel               int               `json:"log_channel" yaml:"log_channel" xml:"log_channel"`                                              // Buffer size for async channel
+	WorkerPoolSize           int               `json:"worker_pool_size" yaml:"worker_pool_size" xml:"worker_pool_size"`                               // Initial worker goroutines
+	MaxWorkerPoolSize        int               `json:"max_worker_pool_size" yaml:"max_worker_pool_size" xml:"max_worker_pool_size"`                   // Max worker goroutines
+	EnableObjectPooling      bool              `json:"enable_object_pooling" yaml:"enable_object_pooling" xml:"enable_object_pooling"`                // Use sync.Pool for LogPayloads
 }
 
 // OutputTarget defines a logger type to forward logs to.
 type OutputTarget struct {
-	Type string `json:"type"` // e.g., "message", "error"
+	Type string `json:"type" yaml:"type" xml:"type"` // e.g., "message", "error"
 }
 
 // AdditionalOutputConfig specifies other loggers to forward logs to.
 type AdditionalOutputConfig struct {
-	SlogOutputs []OutputTarget `json:"slog_outputs"`
-	StdOutputs  []OutputTarget `json:"std_outputs"`
+	SlogOutputs []OutputTarget `json:"slog_outputs" yaml:"slog_outputs" xml:"slog_outputs"`
+	StdOutputs  []OutputTarget `json:"std_outputs" yaml:"std_outputs" xml:"std_outputs"`
 }
 
 // FileConfig holds settings for a specific logger type (e.g., "error").
 type FileConfig struct {
-	Path              string                 `json:"path"`               // Log file path
-	MaxSizeMB         int                    `json:"max_size_mb"`        // For rotation
-	MaxBackups        int                    `json:"max_backups"`        // For rotation
-	MaxAgeDays        int                    `json:"max_age_days"`       // For rotation
-	Compress          bool                   `json:"compress"`           // For rotation
-	MinLevel          string                 `json:"min_level"`          // e.g., "debug", "info"
-	Structured        bool                   `json:"structured"`         // Unused? SlogWriter seems to control this
-	StdWriter         bool                   `json:"std_writer"`         // Enable standard log.Logger
-	SlogWriter        bool                   `json:"slog_writer"`        // Enable structured slog.Logger
-	ConsoleStd        bool                   `json:"console_std"`        // Echo logs to os.Stderr
-	UseFileWriter     bool                   `json:"use_file_writer"`    // Write to file (true) or io.Discard (false)
-	AdditionalOutputs AdditionalOutputConfig `json:"additional_outputs"` // Log forwarding
+	Path              string                 `json:"path" yaml:"path" xml:"path"`                                           // Log file path
+	MaxSizeMB         int                    `json:"max_size_mb" yaml:"max_size_mb" xml:"max_size_mb"`                      // For rotation
+	MaxBackups        int                    `json:"max_backups" yaml:"max_backups" xml:"max_backups"`                      // For rotation
+	MaxAgeDays        int                    `json:"max_age_days" yaml:"max_age_days" xml:"max_age_days"`                   // For rotation
+	Compress          bool                   `json:"compress" yaml:"compress" xml:"compress"`                               // For rotation
+	MinLevel          string                 `json:"min_level" yaml:"min_level" xml:"min_level"`                            // e.g., "debug", "info"
+	Structured        bool                   `json:"structured" yaml:"structured" xml:"structured"`                         // Unused? SlogWriter seems to control this
+	StdWriter         bool                   `json:"std_writer" yaml:"std_writer" xml:"std_writer"`                         // Enable standard log.Logger
+	SlogWriter        bool                   `json:"slog_writer" yaml:"slog_writer" xml:"slog_writer"`                      // Enable structured slog.Logger
+	ConsoleStd        bool                   `json:"console_std" yaml:"console_std" xml:"console_std"`                      // Echo logs to os.Stderr
+	UseFileWriter     bool                   `json:"use_file_writer" yaml:"use_file_writer" xml:"use_file_writer"`          // Write to file (true) or io.Discard (false)
+	AdditionalOutputs AdditionalOutputConfig `json:"additional_outputs" yaml:"additional_outputs" xml:"additional_outputs"` // Log forwarding
 }
 
 // --- Helper functions for safe access to global state ---

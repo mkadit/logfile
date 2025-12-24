@@ -3,8 +3,13 @@ package logfile
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -257,13 +262,27 @@ func LoadConfigurationFromFile(filePath string) error {
 	}
 
 	var loadedConfig LogConfiguration
+	var unmarshalErr error
 
-	if err := json.Unmarshal(file, &loadedConfig); err != nil {
-		return fmt.Errorf("failed to unmarshal configuration JSON: %w", err)
+	// Determine format by file extension
+	ext := strings.ToLower(filepath.Ext(filePath))
+
+	switch ext {
+	case ".json":
+		unmarshalErr = json.Unmarshal(file, &loadedConfig)
+	case ".yaml", ".yml":
+		unmarshalErr = yaml.Unmarshal(file, &loadedConfig)
+	case ".xml":
+		unmarshalErr = xml.Unmarshal(file, &loadedConfig)
+	default:
+		return fmt.Errorf("unsupported file extension '%s' (expected .json, .yaml, .yml, or .xml)", ext)
+	}
+
+	if unmarshalErr != nil {
+		return fmt.Errorf("failed to unmarshal configuration (%s): %w", ext, unmarshalErr)
 	}
 
 	// Store the new config atomically.
-	// Functions like getConfigValue() will now see this new version.
 	Config.Store(&loadedConfig)
 	return nil
 }
