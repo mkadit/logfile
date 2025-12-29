@@ -589,6 +589,16 @@ func (f *JSONFormatter) FormatRecord(level LogLevel, eventType string, err error
 				record[sa.Key] = f.formatTime(sa.Value.Time())
 			case slog.KindAny:
 				record[sa.Key] = f.formatAny(safeValue)
+			case slog.KindGroup:
+				// Handle slog.Group - recursively process group attributes
+				groupAttrs := sa.Value.Group() // Get []slog.Attr from group
+				groupResult := make(map[string]any, len(groupAttrs))
+
+				for _, groupAttr := range groupAttrs {
+					groupResult[groupAttr.Key] = f.formatAny(groupAttr.Value.Any())
+				}
+
+				record[sa.Key] = groupResult
 			}
 		} else {
 			// It's a plain 'any' type
