@@ -760,7 +760,6 @@ func CriticalCapture(ml *MessageLog, async bool, err error, message string, attr
 	return string(jsonBytes), nil
 }
 
-
 // CaptureInfo generates JSON representation of an informational message without logging.
 func CaptureInfo(ml *MessageLog, message string, attr ...any) (string, error) {
 	// Get configuration for JSON formatting
