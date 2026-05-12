@@ -1213,3 +1213,115 @@ func percentile(durations []time.Duration, p float64) time.Duration {
 
 	return durations[index]
 }
+
+// ============================================================================
+// SECTION 13: Runtime Metrics Tests
+// ============================================================================
+
+func TestRuntimeMetricsCollection(t *testing.T) {
+	// Test with metrics enabled
+	config := logfile.TestLogConfiguration()
+	config.General.AddMetrics = true
+	config.General.MetricsInterval = 5 // 5 seconds for testing
+
+	logfile.LoadConfigurationFromStruct(&config)
+	defer func() {
+		// Restore original config
+		originalConfig := logfile.TestLogConfiguration()
+		logfile.LoadConfigurationFromStruct(&originalConfig)
+	}()
+
+	// Test manual metrics collection
+	metrics := logfile.GetRuntimeMetrics()
+	if metrics == nil {
+		t.Fatal("Expected runtime metrics, got nil")
+	}
+
+	// Verify basic metrics are populated
+	if metrics.HeapAlloc == 0 {
+		t.Error("Expected HeapAlloc to be non-zero")
+	}
+
+	if metrics.Goroutines == 0 {
+		t.Error("Expected Goroutines to be non-zero")
+	}
+
+	if metrics.CollectionInterval != 5 {
+		t.Errorf("Expected CollectionInterval to be 5, got %d", metrics.CollectionInterval)
+	}
+
+	// Test manual metrics logging
+	logfile.LogRuntimeMetrics(nil, true)
+
+	// Test configuration retrieval
+	metricsConfig := logfile.GetMetricsConfig()
+	if metricsConfig == nil {
+		t.Fatal("Expected metrics config, got nil")
+	}
+
+	if !metricsConfig.AddMetrics {
+		t.Error("Expected AddMetrics to be true")
+	}
+
+	// Test detailed metrics
+	config.General.DetailedMetrics = true
+	logfile.LoadConfigurationFromStruct(&config)
+
+	metrics = logfile.GetRuntimeMetrics()
+	if metrics.HeapSys == 0 {
+		t.Error("Expected HeapSys to be non-zero when detailed metrics enabled")
+	}
+
+	// Test CPU metrics
+	config.General.CPUMetrics = true
+	logfile.LoadConfigurationFromStruct(&config)
+
+	metrics = logfile.GetRuntimeMetrics()
+	// CPU metrics might be 0 on non-Linux systems or if /proc/loadavg is not accessible
+	// so we just verify the function doesn't panic
+}
+
+func TestRuntimeMetricsDisabled(t *testing.T) {
+	// Test with metrics disabled
+	config := logfile.TestLogConfiguration()
+	config.General.AddMetrics = false
+
+	logfile.LoadConfigurationFromStruct(&config)
+	defer func() {
+		// Restore original config
+		originalConfig := logfile.TestLogConfiguration()
+		logfile.LoadConfigurationFromStruct(&originalConfig)
+	}()
+
+	// Metrics should still be collectible manually, but background collector won't run
+	metrics := logfile.GetRuntimeMetrics()
+	if metrics == nil {
+		t.Fatal("Expected runtime metrics, got nil")
+	}
+
+	// Background collection should not be active
+	time.Sleep(1 * time.Second)
+	lastMetrics := logfile.GetLastRuntimeMetrics()
+	// Should be nil since background collector is disabled
+	if lastMetrics != nil {
+		t.Error("Expected last metrics to be nil when disabled")
+	}
+}
+
+func BenchmarkMetricsCollection(b *testing.B) {
+	config := logfile.TestLogConfiguration()
+	config.General.AddMetrics = true
+	logfile.LoadConfigurationFromStruct(&config)
+	defer func() {
+		originalConfig := logfile.TestLogConfiguration()
+		logfile.LoadConfigurationFromStruct(&originalConfig)
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		metrics := logfile.GetRuntimeMetrics()
+		if metrics == nil {
+			b.Fatal("Expected runtime metrics, got nil")
+		}
+	}
+}

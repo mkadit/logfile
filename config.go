@@ -37,6 +37,7 @@ func DefaultLogConfiguration() LogConfiguration {
 				"error":    "error",
 				"critical": "critical",
 				"nmm":      "info",
+				"metrics":  "info",
 			},
 			DevelopmentMode:          false, // Disable debug logging by default
 			PrettyPrint:              false, // Use structured JSON for production
@@ -46,6 +47,12 @@ func DefaultLogConfiguration() LogConfiguration {
 			WorkerPoolSize:           8,     // Start with 8 worker goroutines
 			MaxWorkerPoolSize:        32,    // Allow scaling up to 32 workers
 			EnableObjectPooling:      true,  // Use sync.Pool to reduce GC pressure
+
+			// Runtime Metrics Configuration
+			AddMetrics:      true,  // Enable runtime metrics collection by default
+			DetailedMetrics: false, // Disable detailed metrics by default for performance
+			CPUMetrics:      false, // Disable CPU metrics by default
+			MetricsInterval: 30,    // Collect metrics every 30 seconds
 		},
 		Files: map[string]FileConfig{
 			// 'index' is the centralized logger.
@@ -201,6 +208,24 @@ func DefaultLogConfiguration() LogConfiguration {
 					StdOutputs:  []OutputTarget{},
 				},
 			},
+			// 'metrics' logger for runtime metrics collection
+			"metrics": {
+				Path:          "logs/Metrics/Metrics.log",
+				MinLevel:      "info",
+				MaxSizeMB:     100,
+				MaxBackups:    10,
+				MaxAgeDays:    30, // Keep metrics logs longer
+				Compress:      true,
+				Structured:    true,
+				StdWriter:     false,
+				SlogWriter:    true,  // Use structured logging for metrics
+				ConsoleStd:    false, // Don't echo metrics to console
+				UseFileWriter: true,  // Write metrics to file
+				AdditionalOutputs: AdditionalOutputConfig{
+					SlogOutputs: []OutputTarget{},
+					StdOutputs:  []OutputTarget{},
+				},
+			},
 		},
 	}
 }
@@ -219,6 +244,7 @@ func TestLogConfiguration() LogConfiguration {
 				"error":    "error",
 				"critical": "critical",
 				"nmm":      "info",
+				"metrics":  "info",
 			},
 			DevelopmentMode:          false,
 			PrettyPrint:              false,
@@ -228,6 +254,12 @@ func TestLogConfiguration() LogConfiguration {
 			WorkerPoolSize:           4,
 			MaxWorkerPoolSize:        16,
 			EnableObjectPooling:      true,
+
+			// Runtime Metrics Configuration (disabled for tests)
+			AddMetrics:      false, // Disable metrics for tests
+			DetailedMetrics: false,
+			CPUMetrics:      false,
+			MetricsInterval: 30,
 		},
 		Files: map[string]FileConfig{
 			// Index logger configured to discard everything
@@ -241,6 +273,24 @@ func TestLogConfiguration() LogConfiguration {
 				Structured:    false,
 				StdWriter:     false,
 				SlogWriter:    false,
+				ConsoleStd:    false,
+				UseFileWriter: false, // Disabled for tests
+				AdditionalOutputs: AdditionalOutputConfig{
+					SlogOutputs: []OutputTarget{},
+					StdOutputs:  []OutputTarget{},
+				},
+			},
+			// Metrics logger configured to discard everything
+			"metrics": {
+				Path:          "logs/Metrics/Metrics.log",
+				MinLevel:      "info",
+				MaxSizeMB:     100,
+				MaxBackups:    10,
+				MaxAgeDays:    30,
+				Compress:      true,
+				Structured:    true,
+				StdWriter:     false,
+				SlogWriter:    false, // Disabled for tests
 				ConsoleStd:    false,
 				UseFileWriter: false, // Disabled for tests
 				AdditionalOutputs: AdditionalOutputConfig{
@@ -284,6 +334,10 @@ func LoadConfigurationFromFile(filePath string) error {
 
 	// Store the new config atomically.
 	Config.Store(&loadedConfig)
+
+	// Update metrics configuration for hot-reload
+	UpdateMetricsConfig(&loadedConfig)
+
 	return nil
 }
 
@@ -300,6 +354,10 @@ func LoadConfigurationFromBytes(data []byte) error {
 	// Store the new config atomically.
 	// Functions like getConfigValue() will now see this new version.
 	Config.Store(&loadedConfig)
+
+	// Update metrics configuration for hot-reload
+	UpdateMetricsConfig(&loadedConfig)
+
 	return nil
 }
 
@@ -314,6 +372,10 @@ func LoadConfigurationFromStruct(config *LogConfiguration) error {
 	// Store the provided config struct atomically.
 	// Functions like getConfigValue() will now see this new version.
 	Config.Store(config)
+
+	// Update metrics configuration for hot-reload
+	UpdateMetricsConfig(config)
+
 	return nil
 }
 

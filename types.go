@@ -54,6 +54,10 @@ var (
 	// Testing is a flag to modify behavior during tests (e.g., Fatal logs don't os.Exit).
 	Testing bool
 
+	// metricsCollector holds the global metrics collector instance
+	metricsCollector *MetricsCollector
+	metricsMutex     sync.RWMutex
+
 	// logPayloadPool holds reusable LogPayload objects to reduce allocations.
 	logPayloadPool = sync.Pool{
 		New: func() interface{} {
@@ -237,6 +241,7 @@ type Loggers struct {
 	NMMLogger      *MultLogger
 	DebugLogger    *MultLogger
 	IndexLogger    *MultLogger // The centralized logger
+	MetricsLogger  *MultLogger // Dedicated logger for runtime metrics
 }
 
 // LogConfiguration is the top-level struct for the JSON config file.
@@ -256,6 +261,12 @@ type GeneralConfig struct {
 	WorkerPoolSize           int               `json:"worker_pool_size" yaml:"worker_pool_size" xml:"worker_pool_size"`                               // Initial worker goroutines
 	MaxWorkerPoolSize        int               `json:"max_worker_pool_size" yaml:"max_worker_pool_size" xml:"max_worker_pool_size"`                   // Max worker goroutines
 	EnableObjectPooling      bool              `json:"enable_object_pooling" yaml:"enable_object_pooling" xml:"enable_object_pooling"`                // Use sync.Pool for LogPayloads
+
+	// Runtime Metrics Configuration
+	AddMetrics      bool `json:"add_metrics" yaml:"add_metrics" xml:"add_metrics"`                // Enable runtime metrics collection (default: true)
+	DetailedMetrics bool `json:"detailed_metrics" yaml:"detailed_metrics" xml:"detailed_metrics"` // Enable detailed metrics collection (default: false)
+	CPUMetrics      bool `json:"cpu_metrics" yaml:"cpu_metrics" xml:"cpu_metrics"`                // Enable CPU metrics collection (default: false)
+	MetricsInterval int  `json:"metrics_interval" yaml:"metrics_interval" xml:"metrics_interval"` // Metrics collection interval in seconds (default: 30)
 }
 
 // OutputTarget defines a logger type to forward logs to.

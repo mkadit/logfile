@@ -106,6 +106,26 @@ func CreateLogger() {
 		Fatal(nil, err, "SYSTEM: logger cannot be set")
 	}
 
+	// Initialize metrics collector if enabled
+	if currentConfig.General.AddMetrics {
+		metricsMutex.Lock()
+		interval := time.Duration(currentConfig.General.MetricsInterval) * time.Second
+		if interval <= 0 {
+			interval = 30 * time.Second // Default to 30 seconds
+		}
+
+		metricsConfig := &MetricsConfig{
+			AddMetrics:      currentConfig.General.AddMetrics,
+			DetailedMetrics: currentConfig.General.DetailedMetrics,
+			CPUMetrics:      currentConfig.General.CPUMetrics,
+			MetricsInterval: currentConfig.General.MetricsInterval,
+		}
+
+		metricsCollector = NewMetricsCollector(interval, metricsConfig)
+		metricsCollector.Start()
+		metricsMutex.Unlock()
+	}
+
 	// Log that the logger is ready
 	Info(nil, false, "logger created",
 		slog.Group("data",
@@ -266,6 +286,13 @@ func Shutdown() {
 		}
 		scalerMutex.Unlock()
 
+		// Stop the metrics collector
+		metricsMutex.RLock()
+		if metricsCollector != nil {
+			metricsCollector.Stop()
+		}
+		metricsMutex.RUnlock()
+
 		// Wait a brief moment for any in-flight logs to be sent to the channel
 		time.Sleep(50 * time.Millisecond)
 
@@ -327,6 +354,7 @@ func SetLogger() error {
 		flushLogger(oldAppLogger.NMMLogger)
 		flushLogger(oldAppLogger.DebugLogger)
 		flushLogger(oldAppLogger.IndexLogger)
+		flushLogger(oldAppLogger.MetricsLogger)
 	}
 
 	// Create new logger holders
@@ -411,6 +439,8 @@ func SetLogger() error {
 			newAppLogger.DebugLogger = ml
 		case "index":
 			newAppLogger.IndexLogger = ml
+		case "metrics":
+			newAppLogger.MetricsLogger = ml
 		}
 	}
 
