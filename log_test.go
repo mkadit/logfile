@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1215,8 +1216,221 @@ func percentile(durations []time.Duration, p float64) time.Duration {
 }
 
 // ============================================================================
-// SECTION 13: Runtime Metrics Tests
+// SECTION 12b: Converter Tests — []byte readability in standard logger
 // ============================================================================
+
+// KVType mimics the data structs the user logs (Key+Value pattern)
+type KVType struct {
+	Key   string
+	Value any
+}
+
+// ISOStruct mimics an ISO 8583 message with nested fields
+type ISOStruct struct {
+	FullMessage string
+	MTI         string
+	Fields      map[string]string
+}
+
+func TestFormatValueForStdLogger(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   any
+		checkFn func(t *testing.T, result string)
+	}{
+		{
+			name:  "flat_byte_slice",
+			input: []byte("0200"),
+			checkFn: func(t *testing.T, r string) {
+				if r != "0200" {
+					t.Errorf("expected '0200', got '%s'", r)
+				}
+			},
+		},
+		{
+			name:  "basic_type_string",
+			input: "hello",
+			checkFn: func(t *testing.T, r string) {
+				if r != "hello" {
+					t.Errorf("expected 'hello', got '%s'", r)
+				}
+			},
+		},
+		{
+			name:  "nil_interface",
+			input: nil,
+			checkFn: func(t *testing.T, r string) {
+				// Should not panic; %+v on nil shows "<nil>"
+				if r != "<nil>" {
+					t.Errorf("expected '<nil>', got '%s'", r)
+				}
+			},
+		},
+		{
+			name: "slice_of_kv_structs",
+			input: []KVType{
+				{Key: "header", Value: map[string]any{"Authorization": "Bearer token123"}},
+				{Key: "body", Value: map[string]any{"success": true, "code": 200}},
+			},
+			checkFn: func(t *testing.T, r string) {
+				// Should contain the key names and values
+				if !strings.Contains(r, "header") {
+					t.Errorf("result should contain 'header', got: %s", r)
+				}
+				if !strings.Contains(r, "Bearer token123") {
+					t.Errorf("result should contain 'Bearer token123', got: %s", r)
+				}
+				if !strings.Contains(r, "body") {
+					t.Errorf("result should contain 'body', got: %s", r)
+				}
+				if !strings.Contains(r, "success") {
+					t.Errorf("result should contain 'success', got: %s", r)
+				}
+				// Should NOT contain []byte format
+				if strings.Contains(r, "[66 101 97 114 101 114") {
+					t.Errorf("result should not contain byte slice format, got: %s", r)
+				}
+			},
+		},
+		{
+			name: "iso_struct",
+			input: ISOStruct{
+				FullMessage: "0200F23E440128E190000000000000001600",
+				MTI:         "0200",
+				Fields: map[string]string{
+					"2":  "6015921000651304",
+					"3":  "401000",
+					"48": "WELI HANDAYANI HARRYANTO KURNIAWAN",
+				},
+			},
+			checkFn: func(t *testing.T, r string) {
+				if !strings.Contains(r, "FullMessage") {
+					t.Errorf("result should contain 'FullMessage', got: %s", r)
+				}
+				if !strings.Contains(r, "MTI") {
+					t.Errorf("result should contain 'MTI', got: %s", r)
+				}
+				if !strings.Contains(r, "6015921000651304") {
+					t.Errorf("result should contain '6015921000651304', got: %s", r)
+				}
+			},
+		},
+		{
+			name:  "nested_maps_in_interface",
+			input: map[string]any{"outer": map[string]any{"inner": "value"}},
+			checkFn: func(t *testing.T, r string) {
+				if !strings.Contains(r, "outer") || !strings.Contains(r, "inner") || !strings.Contains(r, "value") {
+					t.Errorf("result should contain all nested keys/values, got: %s", r)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := logfile.FormatValueForStdLogger(tt.input)
+			tt.checkFn(t, result)
+		})
+	}
+}
+
+// ============================================================================
+// SECTION 12c: Integration Test — Converter through full log flow
+// ============================================================================
+
+func TestLogFlowWithComplexAttrs(t *testing.T) {
+	setupTest(t)
+	defer teardownTest(t)
+
+	// Use sync logging to avoid async timing issues in test
+	// This tests the full flow: logToSpecificLogger → formatStandardLog
+	// with complex nested structs containing maps and slices
+
+	t.Run("sync_kv_structs", func(t *testing.T) {
+		data := []KVType{
+			{Key: "header", Value: map[string]any{"Authorization": "Bearer tok123", "Content-Type": "application/json"}},
+			{Key: "body", Value: map[string]any{"success": true, "code": 200, "message": "OK"}},
+		}
+
+		// Should not panic and should render maps readably
+		logfile.Info(nil, false, "test kv data", slog.Any("data", data))
+	})
+
+	t.Run("sync_iso_struct", func(t *testing.T) {
+		iso := ISOStruct{
+			FullMessage: "0200F23E440128E190000000000000001600",
+			MTI:         "0200",
+			Fields: map[string]string{
+				"2":  "6015921000651304",
+				"3":  "401000",
+				"48": "WELI HANDAYANI HARRYANTO KURNIAWAN",
+			},
+		}
+
+		logfile.Info(nil, false, "test iso data", slog.Any("iso", iso))
+	})
+
+	t.Run("sync_deeply_nested", func(t *testing.T) {
+		type Inner struct {
+			Name    string
+			Tags    map[string]string
+			Payload []byte
+		}
+		type Outer struct {
+			Code   string
+			Inner  Inner
+			Values map[string]any
+		}
+
+		data := Outer{
+			Code: "REQ001",
+			Inner: Inner{
+				Name:    "test",
+				Tags:    map[string]string{"env": "prod", "region": "us"},
+				Payload: []byte("hello world"),
+			},
+			Values: map[string]any{
+				"count": 42,
+				"nested": map[string]any{
+					"key":  "val",
+					"data": []byte("nested bytes"),
+				},
+			},
+		}
+
+		logfile.Info(nil, false, "test deeply nested", slog.Any("data", data))
+	})
+
+	t.Run("async_fills_after_dispatch", func(t *testing.T) {
+		// Simulate the pattern: data is initially sparse, then filled after dispatch
+		type RequestData struct {
+			Header map[string]string
+			Body   map[string]string
+		}
+
+		req := &RequestData{}
+		// Fill header AFTER creating the object
+		req.Header = map[string]string{"Authorization": "Bearer tok"}
+
+		// Pass pointer so deepCopyAny returns same pointer
+		logfile.Info(nil, true, "async request with partial data", slog.Any("req", req))
+
+		// Fill body AFTER async dispatch (simulates real-world timing)
+		req.Body = map[string]string{"key": "value"}
+		time.Sleep(100 * time.Millisecond)
+		// At this point the async worker may have processed before or after the fill
+	})
+
+	t.Run("nil_interface_field", func(t *testing.T) {
+		type WithAny struct {
+			Name string
+			Data any
+		}
+
+		// Data is nil — our converter must handle nil interface
+		logfile.Info(nil, false, "nil interface field", slog.Any("item", WithAny{Name: "test"}))
+	})
+}
 
 func TestRuntimeMetricsCollection(t *testing.T) {
 	// Test with metrics enabled

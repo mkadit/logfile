@@ -324,7 +324,7 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 			// Format for standard logger (guarded)
 			if logger.IsStandardActive() {
 				originalAttrsForStd = append(originalAttrsForStd,
-					fmt.Sprintf("%s: %s", sa.Key, formatValueForStdLogger(safeValue)))
+					fmt.Sprintf("%s: %s", sa.Key, FormatValueForStdLogger(safeValue)))
 			}
 		} else {
 			// It's a plain 'any' type, treat it as a generic argument
@@ -440,7 +440,7 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 		if s, ok := a.(string); ok {
 			additionalAttrs = append(additionalAttrs, s)
 		} else {
-			additionalAttrs = append(additionalAttrs, formatValueForStdLogger(a))
+			additionalAttrs = append(additionalAttrs, FormatValueForStdLogger(a))
 		}
 	}
 
@@ -480,11 +480,11 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 	return fmt.Sprintf("[%s][SYSTEM][%s]", timeNow, msg)
 }
 
-// formatValueForStdLogger formats a value for standard logger output.
+// FormatValueForStdLogger formats a value for standard logger output.
 // []byte is converted to string for readability; complex types (structs, maps,
 // slices) are recursively walked to convert all nested []byte to string,
 // producing a readable representation.
-func formatValueForStdLogger(v any) string {
+func FormatValueForStdLogger(v any) string {
 	if b, ok := v.([]byte); ok {
 		return string(b)
 	}
@@ -552,6 +552,9 @@ func convertToReadableValue(rv reflect.Value) any {
 		return result
 
 	case reflect.Interface:
+		if rv.IsNil() {
+			return nil
+		}
 		return convertToReadableValue(rv.Elem())
 
 	default:
