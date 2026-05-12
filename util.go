@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -293,8 +294,10 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 
 	// --- Process 'otherAttrs' (from Info, Error, etc.) ---
 
-	// This slice is for the standard (non-structured) logger
-	originalAttrsForStd := make([]any, 0, len(otherAttrs))
+	var originalAttrsForStd []any
+	if logger.IsStandardActive() {
+		originalAttrsForStd = make([]any, 0, len(otherAttrs))
+	}
 	var firstComplexAttr any
 	hasComplexAttr := false
 
@@ -318,9 +321,11 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 				Value: slog.AnyValue(safeValue),
 			})
 
-			// Format for standard logger
-			originalAttrsForStd = append(originalAttrsForStd,
-				fmt.Sprintf("%s: %v", sa.Key, safeValue))
+			// Format for standard logger (guarded)
+			if logger.IsStandardActive() {
+				originalAttrsForStd = append(originalAttrsForStd,
+					fmt.Sprintf("%s: %s", sa.Key, formatValueForStdLogger(safeValue)))
+			}
 		} else {
 			// It's a plain 'any' type, treat it as a generic argument
 			var safeCopy any
@@ -335,7 +340,9 @@ func logToSpecificLogger(logger *MultLogger, level LogLevel, eventType string, e
 			}
 
 			slogAttrs = append(slogAttrs, slog.Any("arg", safeCopy))
-			originalAttrsForStd = append(originalAttrsForStd, safeCopy)
+			if logger.IsStandardActive() {
+				originalAttrsForStd = append(originalAttrsForStd, safeCopy)
+			}
 		}
 	}
 
@@ -427,12 +434,13 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 	}
 
 	// Add other attributes
+	// Note: slog.Attr values arrive pre-formatted as "key: value" strings
+	// from logToSpecificLogger. Plain any values are formatted inline.
 	for _, a := range otherAttrs {
-		if sa, ok := a.(slog.Attr); ok {
-			additionalAttrs = append(additionalAttrs,
-				fmt.Sprintf("%s=%v", sa.Key, sa.Value.Any()))
+		if s, ok := a.(string); ok {
+			additionalAttrs = append(additionalAttrs, s)
 		} else {
-			additionalAttrs = append(additionalAttrs, fmt.Sprintf("%v", a))
+			additionalAttrs = append(additionalAttrs, formatValueForStdLogger(a))
 		}
 	}
 
@@ -446,8 +454,10 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 	if err != nil {
 		if hasComplexAttr {
 			// Special format for complex attributes + error
+			// Convert []byte fields to string for readability
+			converted := convertToReadable(firstComplexAttr)
 			return fmt.Sprintf("[%s][%s][%T|%+v|%s|%+v][%v]",
-				timeNow, logType, firstComplexAttr, firstComplexAttr,
+				timeNow, logType, converted, converted,
 				msg, WithStack(err), additionalAttrsStr)
 		}
 		// Standard error format
@@ -468,6 +478,85 @@ func formatStandardLog(msg, timeNow, logType string, err error, ml *MessageLog,
 		return fmt.Sprintf("[%s][SYSTEM][%s|%v]", timeNow, msg, additionalAttrsStr)
 	}
 	return fmt.Sprintf("[%s][SYSTEM][%s]", timeNow, msg)
+}
+
+// formatValueForStdLogger formats a value for standard logger output.
+// []byte is converted to string for readability; complex types (structs, maps,
+// slices) are recursively walked to convert all nested []byte to string,
+// producing a readable representation.
+func formatValueForStdLogger(v any) string {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	if isBasicType(v) {
+		return fmt.Sprintf("%v", v)
+	}
+	converted := convertToReadable(v)
+	return fmt.Sprintf("%+v", converted)
+}
+
+// convertToReadable recursively walks a value and converts all []byte to string,
+// returning a tree of plain Go types (map[string]any, []any, string) that
+// fmt.Sprintf("%+v") can render readably.
+func convertToReadable(v any) any {
+	if v == nil {
+		return nil
+	}
+	return convertToReadableValue(reflect.ValueOf(v))
+}
+
+func convertToReadableValue(rv reflect.Value) any {
+	switch rv.Kind() {
+	case reflect.Slice:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return string(rv.Bytes())
+		}
+		l := rv.Len()
+		result := make([]any, l)
+		for i := 0; i < l; i++ {
+			result[i] = convertToReadableValue(rv.Index(i))
+		}
+		return result
+
+	case reflect.Struct:
+		t := rv.Type()
+		result := make(map[string]any, t.NumField())
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.IsExported() {
+				result[f.Name] = convertToReadableValue(rv.Field(i))
+			}
+		}
+		return result
+
+	case reflect.Map:
+		result := make(map[string]any, rv.Len())
+		for _, key := range rv.MapKeys() {
+			k := fmt.Sprintf("%v", convertToReadableValue(key))
+			result[k] = convertToReadableValue(rv.MapIndex(key))
+		}
+		return result
+
+	case reflect.Ptr:
+		if rv.IsNil() {
+			return nil
+		}
+		return convertToReadableValue(rv.Elem())
+
+	case reflect.Array:
+		l := rv.Len()
+		result := make([]any, l)
+		for i := 0; i < l; i++ {
+			result[i] = convertToReadableValue(rv.Index(i))
+		}
+		return result
+
+	case reflect.Interface:
+		return convertToReadableValue(rv.Elem())
+
+	default:
+		return rv.Interface()
+	}
 }
 
 // isBasicType checks if a value is a basic (non-reference) type.
