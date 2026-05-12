@@ -1412,7 +1412,7 @@ func TestLogFlowWithComplexAttrs(t *testing.T) {
 		// Fill header AFTER creating the object
 		req.Header = map[string]string{"Authorization": "Bearer tok"}
 
-		// Pass pointer so deepCopyAny returns same pointer
+		// deepCopyAny now copies the pointer via reflection
 		logfile.Info(nil, true, "async request with partial data", slog.Any("req", req))
 
 		// Fill body AFTER async dispatch (simulates real-world timing)
@@ -1429,6 +1429,18 @@ func TestLogFlowWithComplexAttrs(t *testing.T) {
 
 		// Data is nil — our converter must handle nil interface
 		logfile.Info(nil, false, "nil interface field", slog.Any("item", WithAny{Name: "test"}))
+	})
+
+	t.Run("slog_group_attrs", func(t *testing.T) {
+		// slog.Group creates slog.Value with no exported fields.
+		// Our converter must unwrap via .Any() to see the actual values.
+		logfile.Info(nil, false, "server started",
+			slog.Group("data",
+				slog.String("service", "middleware"),
+				slog.Int("port", 8083),
+				slog.Duration("read_timeout", 0),
+				slog.Duration("keep_alive_period", 0),
+			))
 	})
 }
 

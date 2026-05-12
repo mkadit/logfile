@@ -128,10 +128,87 @@ func deepCopyAny(value any) any {
 		i := *v
 		return &i
 
-	// Default: return the value as-is (e.g., custom structs).
-	// This may not be race-safe if the struct contains reference types.
+	// --- Reflection-based fallback for arbitrary types ---
+	// Handles custom structs, pointers, interfaces, slices, maps, arrays
+	// that aren't covered by the concrete type assertions above.
 	default:
-		return value
+		rv := reflect.ValueOf(value)
+		switch rv.Kind() {
+		case reflect.Ptr:
+			if rv.IsNil() {
+				return nil
+			}
+			elem := deepCopyAny(rv.Elem().Interface())
+			newPtr := reflect.New(rv.Type().Elem())
+			newPtr.Elem().Set(reflect.ValueOf(elem))
+			return newPtr.Interface()
+
+		case reflect.Struct:
+			// Unwrap slog.Value before field iteration (all fields unexported)
+			if sv, ok := value.(slog.Value); ok {
+				return deepCopyAny(sv.Any())
+			}
+			result := reflect.New(rv.Type()).Elem()
+			for i := 0; i < rv.NumField(); i++ {
+				field := rv.Field(i)
+				if !field.CanInterface() {
+					continue // unexported field
+				}
+				fieldVal := field.Interface()
+				// slog.Value has all unexported fields — re-wrap after deep copy
+				if sv, ok := fieldVal.(slog.Value); ok {
+					copied := slog.AnyValue(deepCopyAny(sv.Any()))
+					result.Field(i).Set(reflect.ValueOf(copied))
+					continue
+				}
+				copied := deepCopyAny(fieldVal)
+				if copied != nil {
+					result.Field(i).Set(reflect.ValueOf(copied))
+				} else {
+					result.Field(i).Set(reflect.Zero(field.Type()))
+				}
+			}
+			return result.Interface()
+
+		case reflect.Slice:
+			if rv.IsNil() {
+				return nil
+			}
+			length := rv.Len()
+			newSlice := reflect.MakeSlice(rv.Type(), length, length)
+			for i := 0; i < length; i++ {
+				newSlice.Index(i).Set(reflect.ValueOf(deepCopyAny(rv.Index(i).Interface())))
+			}
+			return newSlice.Interface()
+
+		case reflect.Map:
+			if rv.IsNil() {
+				return nil
+			}
+			newMap := reflect.MakeMap(rv.Type())
+			for _, key := range rv.MapKeys() {
+				newMap.SetMapIndex(key, reflect.ValueOf(deepCopyAny(rv.MapIndex(key).Interface())))
+			}
+			return newMap.Interface()
+
+		case reflect.Array:
+			length := rv.Len()
+			newArr := reflect.New(rv.Type()).Elem()
+			for i := 0; i < length; i++ {
+				newArr.Index(i).Set(reflect.ValueOf(deepCopyAny(rv.Index(i).Interface())))
+			}
+			return newArr.Interface()
+
+		case reflect.Interface:
+			if rv.IsNil() {
+				return nil
+			}
+			return deepCopyAny(rv.Elem().Interface())
+
+		default:
+			// Channels, functions, unsafe pointers — return as-is
+			return value
+		}
 	}
 }
 
@@ -511,6 +588,16 @@ func convertToReadableValue(rv reflect.Value) any {
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
 			return string(rv.Bytes())
 		}
+		// slog.Group produces []slog.Attr — flatten to a single map
+		if rv.Type() == reflect.TypeOf([]slog.Attr{}) {
+			result := make(map[string]any, rv.Len())
+			for i := 0; i < rv.Len(); i++ {
+				a := rv.Index(i)
+				result[a.FieldByName("Key").String()] =
+					convertToReadableValue(a.FieldByName("Value"))
+			}
+			return result
+		}
 		l := rv.Len()
 		result := make([]any, l)
 		for i := 0; i < l; i++ {
@@ -519,6 +606,11 @@ func convertToReadableValue(rv reflect.Value) any {
 		return result
 
 	case reflect.Struct:
+		// slog.Value has no exported fields — unwrap via .Any() to get
+		// the actual value (string, int, []slog.Attr, etc.)
+		if rv.Type() == reflect.TypeOf(slog.Value{}) {
+			return convertToReadableValue(reflect.ValueOf(rv.Interface().(slog.Value).Any()))
+		}
 		t := rv.Type()
 		result := make(map[string]any, t.NumField())
 		for i := 0; i < t.NumField(); i++ {
