@@ -1,5 +1,5 @@
+// Package logfile custom logging
 // logfile/util.go - Utility functions for logging operations
-// FIXED: MessageLog snapshot instead of mutation, improved caller cache
 package logfile
 
 import (
@@ -33,6 +33,14 @@ var (
 func deepCopyAny(value any) any {
 	if value == nil {
 		return nil
+	}
+
+	// LogValuer types control their own serialization via LogValue().
+	// Call it NOW (synchronously, at dispatch time) to capture a snapshot,
+	// then deep-copy the resulting attrs. This avoids trying to reflect
+	// into types whose fields are all unexported (e.g., iso8583.Message).
+	if lv, ok := value.(slog.LogValuer); ok {
+		return deepCopyAny(lv.LogValue().Any())
 	}
 
 	switch v := value.(type) {
@@ -584,6 +592,9 @@ func convertToReadable(v any) any {
 
 func convertToReadableValue(rv reflect.Value) any {
 	switch rv.Kind() {
+	case reflect.Invalid:
+		return nil
+
 	case reflect.Slice:
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
 			return string(rv.Bytes())
@@ -593,8 +604,7 @@ func convertToReadableValue(rv reflect.Value) any {
 			result := make(map[string]any, rv.Len())
 			for i := 0; i < rv.Len(); i++ {
 				a := rv.Index(i)
-				result[a.FieldByName("Key").String()] =
-					convertToReadableValue(a.FieldByName("Value"))
+				result[a.FieldByName("Key").String()] = convertToReadableValue(a.FieldByName("Value"))
 			}
 			return result
 		}
@@ -609,7 +619,11 @@ func convertToReadableValue(rv reflect.Value) any {
 		// slog.Value has no exported fields — unwrap via .Any() to get
 		// the actual value (string, int, []slog.Attr, etc.)
 		if rv.Type() == reflect.TypeOf(slog.Value{}) {
-			return convertToReadableValue(reflect.ValueOf(rv.Interface().(slog.Value).Any()))
+			val := rv.Interface().(slog.Value).Any()
+			if val == nil {
+				return nil
+			}
+			return convertToReadableValue(reflect.ValueOf(val))
 		}
 		t := rv.Type()
 		result := make(map[string]any, t.NumField())
